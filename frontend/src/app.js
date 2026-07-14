@@ -1,0 +1,1317 @@
+paper.setup(document.getElementById('canvas'));
+
+// --- STATE ---
+let originalSVG = null;
+let workingSVG = null;
+let originalSVGImage = null;
+let originalSVGObjectUrl = null;
+let originalSVGText = '';
+let sourceSvgSizeMm = null;
+let originalSvgDocument = null;
+let layerEntries = [];
+let machineBed = null;
+let originMarker = null;
+let activeJobId = null;
+let cancelRequested = false;
+let previewSvgLoadToken = 0;
+
+let isAnimating = false;
+let simulationStoppedByUser = false;
+let currentPathIndex = 0;
+let currentOffset = 0;
+let penHead = null;
+let allGeneratedPaths = [];
+let generatedPathGcodeRanges = [];
+let gcodeLines = [];
+let gcodeLineOffsets = [];
+let livePreviewCursor = 0;
+let livePreviewInitialized = false;
+let workspaceFitZoom = 1;
+let canvasZoomPercent = 100;
+
+const MACHINE_SETTINGS_KEY = 'hatchPlotter.machineSettings.v1';
+const UI_SETTINGS_KEY = 'hatchPlotter.uiSettings.v1';
+const FIT_MARGIN = 0.9;
+const MM_PER_CSS_PIXEL = 25.4 / 96;
+const MAX_BRIGHTNESS_MAP_DIMENSION = 4096;
+const INKSCAPE_NAMESPACE = 'http://www.inkscape.org/namespaces/inkscape';
+const COLLAPSIBLE_SECTION_IDS = ['machineSection', 'importSection', 'generateSection', 'gcodeSection'];
+const MACHINE_SETTING_IDS = [
+    'bedX',
+    'bedY',
+    'zMode',
+    'zUp',
+    'zDown',
+    'xyFeedRate',
+    'zPlungeRate',
+    'penThickness',
+    'densityFudge'
+];
+
+function readPositiveNumber(id, fallback) {
+    const value = Number.parseFloat(document.getElementById(id).value);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function formatNumber(value, maximumFractionDigits = 2) {
+    return Number(value.toFixed(maximumFractionDigits)).toString();
+}
+
+function parseSvgLengthToMm(rawValue) {
+    if (!rawValue || typeof rawValue !== 'string') return null;
+    const match = rawValue.trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*(mm|cm|in|pt|pc|px|q)?$/i);
+    if (!match) return null;
+    const value = Number.parseFloat(match[1]);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    const unit = (match[2] || 'px').toLowerCase();
+    const factors = {
+        mm: 1,
+        cm: 10,
+        in: 25.4,
+        pt: 25.4 / 72,
+        pc: 25.4 / 6,
+        px: MM_PER_CSS_PIXEL,
+        q: 0.25
+    };
+    return value * factors[unit];
+}
+
+function determineSvgPhysicalSize(svgText, image) {
+    let widthMm = null;
+    let heightMm = null;
+    let viewBoxWidth = null;
+    let viewBoxHeight = null;
+
+    try {
+        const documentNode = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+        const root = documentNode.documentElement;
+        if (root && root.nodeName.toLowerCase() === 'svg') {
+            widthMm = parseSvgLengthToMm(root.getAttribute('width'));
+            heightMm = parseSvgLengthToMm(root.getAttribute('height'));
+            const viewBox = (root.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+            if (viewBox.length === 4 && viewBox.every(Number.isFinite) && viewBox[2] > 0 && viewBox[3] > 0) {
+                viewBoxWidth = viewBox[2];
+                viewBoxHeight = viewBox[3];
+            }
+        }
+    } catch (error) {
+        console.warn('Unable to inspect SVG dimensions:', error);
+    }
+
+    if (widthMm && !heightMm && viewBoxWidth && viewBoxHeight) {
+        heightMm = widthMm * (viewBoxHeight / viewBoxWidth);
+    } else if (heightMm && !widthMm && viewBoxWidth && viewBoxHeight) {
+        widthMm = heightMm * (viewBoxWidth / viewBoxHeight);
+    }
+
+    return {
+        width: widthMm || Math.max(0.01, image.naturalWidth * MM_PER_CSS_PIXEL),
+        height: heightMm || Math.max(0.01, image.naturalHeight * MM_PER_CSS_PIXEL)
+    };
+}
+
+
+function detectSvgLayers(svgText) {
+    const documentNode = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+    if (documentNode.querySelector('parsererror')) {
+        throw new Error('The uploaded SVG contains invalid XML.');
+    }
+
+    const root = documentNode.documentElement;
+    if (!root || root.nodeName.toLowerCase() !== 'svg') {
+        throw new Error('The uploaded file does not contain an <svg> root element.');
+    }
+
+    const candidateLayers = [];
+    const seenNodes = new Set();
+    const groups = Array.from(root.querySelectorAll('g'));
+    for (const node of groups) {
+        const groupMode = node.getAttributeNS(INKSCAPE_NAMESPACE, 'groupmode') || node.getAttribute('inkscape:groupmode') || '';
+        const label = node.getAttributeNS(INKSCAPE_NAMESPACE, 'label') || node.getAttribute('inkscape:label') || node.getAttribute('label') || node.getAttribute('id') || '';
+        if (groupMode === 'layer') {
+            candidateLayers.push({ node, name: label || `Layer ${candidateLayers.length + 1}` });
+            seenNodes.add(node);
+        }
+    }
+
+    if (candidateLayers.length === 0) {
+        for (const node of groups) {
+            if (seenNodes.has(node)) continue;
+            if (node.parentElement !== root) continue;
+            const label = node.getAttributeNS(INKSCAPE_NAMESPACE, 'label') || node.getAttribute('inkscape:label') || node.getAttribute('label') || node.getAttribute('id') || '';
+            if (label.trim()) {
+                candidateLayers.push({ node, name: label.trim() });
+                seenNodes.add(node);
+            }
+        }
+    }
+
+    if (candidateLayers.length === 0) {
+        root.setAttribute('data-hatchplot-layer-id', 'layer-root');
+        return {
+            documentNode,
+            layers: [{ id: 'layer-root', name: 'Artwork', enabled: true, root: true }]
+        };
+    }
+
+    const layers = candidateLayers.map((entry, index) => {
+        const id = `layer-${index + 1}`;
+        entry.node.setAttribute('data-hatchplot-layer-id', id);
+        return {
+            id,
+            name: String(entry.name || `Layer ${index + 1}`).trim() || `Layer ${index + 1}`,
+            enabled: true,
+            root: false,
+        };
+    });
+
+    return { documentNode, layers };
+}
+
+function renderLayerControls() {
+    const container = document.getElementById('layerControls');
+    const enableAllButton = document.getElementById('enableAllLayersBtn');
+    const disableAllButton = document.getElementById('disableAllLayersBtn');
+    container.innerHTML = '';
+
+    if (!layerEntries.length) {
+        container.textContent = 'Upload an SVG to inspect its layers.';
+        enableAllButton.disabled = true;
+        disableAllButton.disabled = true;
+        return;
+    }
+
+    enableAllButton.disabled = false;
+    disableAllButton.disabled = false;
+
+    const summary = document.createElement('div');
+    summary.textContent = `${layerEntries.filter(layer => layer.enabled).length} of ${layerEntries.length} layers enabled`;
+    summary.style.marginBottom = '8px';
+    container.appendChild(summary);
+
+    layerEntries.forEach((layer, index) => {
+        const row = document.createElement('div');
+        row.className = 'checkbox-row';
+        row.style.margin = '4px 0';
+
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = Boolean(layer.enabled);
+        input.id = `svgLayerToggle${index}`;
+        input.dataset.layerId = layer.id;
+
+        const label = document.createElement('label');
+        label.htmlFor = input.id;
+        label.textContent = layer.name;
+        label.style.flex = '1';
+
+        input.addEventListener('change', async () => {
+            layer.enabled = input.checked;
+            renderLayerControls();
+            await reloadPreviewFromLayerSelection(false);
+        });
+
+        row.appendChild(input);
+        row.appendChild(label);
+        container.appendChild(row);
+    });
+}
+
+function setAllLayersEnabled(enabled) {
+    if (!layerEntries.length) return;
+    layerEntries.forEach(layer => { layer.enabled = enabled; });
+    renderLayerControls();
+    reloadPreviewFromLayerSelection(false).catch(error => {
+        console.error('Unable to update layer visibility:', error);
+        generationStatus.textContent = `Layer update failed: ${error.message}`;
+    });
+}
+
+function serializeEnabledSvg() {
+    if (!originalSvgDocument) return originalSVGText;
+    const clone = originalSvgDocument.cloneNode(true);
+
+    for (const layer of layerEntries) {
+        if (layer.enabled) continue;
+        const node = clone.querySelector(`[data-hatchplot-layer-id="${layer.id}"]`);
+        if (!node) continue;
+        if (node === clone.documentElement) {
+            while (node.firstChild) node.removeChild(node.firstChild);
+        } else {
+            node.remove();
+        }
+    }
+    return new XMLSerializer().serializeToString(clone);
+}
+
+function getEnabledLayerNames() {
+    return layerEntries.filter(layer => layer.enabled).map(layer => layer.name);
+}
+
+async function reloadPreviewFromLayerSelection(announceLoad = false) {
+    if (!originalSVGText || !sourceSvgSizeMm) return;
+    clearGeneratedPreview();
+    const enabledSvgText = serializeEnabledSvg();
+    const objectUrl = URL.createObjectURL(new Blob([enabledSvgText], { type: 'image/svg+xml' }));
+    const image = new Image();
+    const loadToken = ++previewSvgLoadToken;
+
+    await new Promise((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error('The selected SVG layers could not be rendered in the browser.'));
+        image.src = objectUrl;
+    });
+
+    if (loadToken !== previewSvgLoadToken) {
+        URL.revokeObjectURL(objectUrl);
+        return;
+    }
+
+    if (originalSVG) originalSVG.remove();
+    if (workingSVG) workingSVG.remove();
+    if (originalSVGObjectUrl) URL.revokeObjectURL(originalSVGObjectUrl);
+
+    originalSVGObjectUrl = objectUrl;
+    originalSVGImage = image;
+    originalSVG = new paper.Raster(image);
+    originalSVG.size = new paper.Size(sourceSvgSizeMm.width, sourceSvgSizeMm.height);
+    originalSVG.position = new paper.Point(0, 0);
+    originalSVG.visible = false;
+    applyTransforms();
+
+    const enabledCount = layerEntries.filter(layer => layer.enabled).length;
+    if (announceLoad) {
+        generationStatus.textContent = enabledCount
+            ? `Loaded SVG at ${formatNumber(sourceSvgSizeMm.width)} × ${formatNumber(sourceSvgSizeMm.height)} mm with ${enabledCount} enabled layer${enabledCount === 1 ? '' : 's'}.`
+            : 'All SVG layers are currently disabled.';
+    } else {
+        generationStatus.textContent = enabledCount
+            ? `${enabledCount} layer${enabledCount === 1 ? '' : 's'} enabled for preview and generation.`
+            : 'All SVG layers are currently disabled.';
+    }
+}
+
+function ensurePenThickness() {
+    const input = document.getElementById('penThickness');
+    let thickness = Number.parseFloat(input.value);
+    if (Number.isFinite(thickness) && thickness >= 0.05 && thickness <= 10) return thickness;
+
+    const response = window.prompt(
+        'Enter the physical pen-tip thickness in millimeters. This controls zig-zag density and G-code preview width:',
+        '0.5'
+    );
+    if (response === null) throw new Error('Pen thickness is required to generate the brightness-driven toolpath.');
+    thickness = Number.parseFloat(response);
+    if (!Number.isFinite(thickness) || thickness < 0.05 || thickness > 10) {
+        throw new Error('Pen thickness must be between 0.05 and 10 mm.');
+    }
+    input.value = formatNumber(thickness, 3);
+    saveMachineSettings();
+    return thickness;
+}
+
+function restoreStoredSettings() {
+    try {
+        const machineSettings = JSON.parse(localStorage.getItem(MACHINE_SETTINGS_KEY) || '{}');
+        MACHINE_SETTING_IDS.forEach(id => {
+            if (machineSettings[id] !== undefined && machineSettings[id] !== null) {
+                document.getElementById(id).value = machineSettings[id];
+            }
+        });
+
+        const uiSettings = JSON.parse(localStorage.getItem(UI_SETTINGS_KEY) || '{}');
+        if (typeof uiSettings.autoCenter === 'boolean') {
+            document.getElementById('autoCenter').checked = uiSettings.autoCenter;
+        }
+        if (typeof uiSettings.autoPreviewGeneration === 'boolean') {
+            document.getElementById('autoPreviewGeneration').checked = uiSettings.autoPreviewGeneration;
+        }
+        if (typeof uiSettings.hideSvgDuringSimulation === 'boolean') {
+            document.getElementById('hideSvgDuringSimulation').checked = uiSettings.hideSvgDuringSimulation;
+        }
+        const sectionStates = uiSettings.sectionStates || {};
+        COLLAPSIBLE_SECTION_IDS.forEach(id => {
+            const section = document.getElementById(id);
+            if (section && typeof sectionStates[id] === 'boolean') section.open = sectionStates[id];
+        });
+    } catch (error) {
+        console.warn('Unable to restore saved Hatch Plotter settings:', error);
+    }
+}
+
+function saveMachineSettings() {
+    try {
+        const settings = {};
+        MACHINE_SETTING_IDS.forEach(id => {
+            settings[id] = document.getElementById(id).value;
+        });
+        localStorage.setItem(MACHINE_SETTINGS_KEY, JSON.stringify(settings));
+        const status = document.getElementById('machineSettingsStatus');
+        status.textContent = 'Machine settings saved in this browser.';
+        window.clearTimeout(saveMachineSettings.statusTimer);
+        saveMachineSettings.statusTimer = window.setTimeout(() => {
+            status.textContent = 'Changes are saved automatically.';
+        }, 1800);
+    } catch (error) {
+        console.warn('Unable to save Hatch Plotter machine settings:', error);
+        document.getElementById('machineSettingsStatus').textContent = 'Browser storage is unavailable; settings were not saved.';
+    }
+}
+
+function saveUiSettings() {
+    try {
+        const sectionStates = {};
+        COLLAPSIBLE_SECTION_IDS.forEach(id => {
+            const section = document.getElementById(id);
+            if (section) sectionStates[id] = section.open;
+        });
+        localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify({
+            autoCenter: document.getElementById('autoCenter').checked,
+            autoPreviewGeneration: document.getElementById('autoPreviewGeneration').checked,
+            hideSvgDuringSimulation: document.getElementById('hideSvgDuringSimulation').checked,
+            sectionStates
+        }));
+    } catch (error) {
+        console.warn('Unable to save Hatch Plotter UI settings:', error);
+    }
+}
+
+function simulationContextIsActive() {
+    const liveSimulation = Boolean(activeJobId)
+        && document.getElementById('autoPreviewGeneration').checked
+        && livePreviewInitialized;
+    return isAnimating || (liveSimulation && !simulationStoppedByUser);
+}
+
+function syncSourceSvgVisibility() {
+    if (!workingSVG) return;
+    const hideDuringSimulation = document.getElementById('hideSvgDuringSimulation').checked;
+    workingSVG.visible = !(hideDuringSimulation && simulationContextIsActive());
+}
+
+function updateSimulationControls() {
+    const stopButton = document.getElementById('stopSimBtn');
+    if (stopButton) stopButton.disabled = !isAnimating;
+}
+
+function clearGeneratedPreview(resetGcode = true, resetStopState = true) {
+    allGeneratedPaths.forEach(path => path.remove());
+    allGeneratedPaths = [];
+    generatedPathGcodeRanges = [];
+    currentPathIndex = 0;
+    currentOffset = 0;
+    if (penHead) {
+        penHead.remove();
+        penHead = null;
+    }
+    isAnimating = false;
+    if (resetStopState) simulationStoppedByUser = false;
+    if (resetGcode) setGcodeLines([]);
+    updateSimulationControls();
+    syncSourceSvgVisibility();
+}
+
+function setCenterInputs() {
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    document.getElementById('svgPosX').value = formatNumber(bedX / 2, 3);
+    document.getElementById('svgPosY').value = formatNumber(bedY / 2, 3);
+}
+
+function centerSvgInWorkspace(apply = true) {
+    setCenterInputs();
+    if (apply) applyTransforms();
+}
+
+// --- WORKSPACE INITIALIZATION ---
+function updateZoomUi() {
+    const slider = document.getElementById('zoomSlider');
+    const label = document.getElementById('zoomLabel');
+    if (slider) slider.value = String(Math.round(canvasZoomPercent));
+    if (label) label.textContent = `${Math.round(canvasZoomPercent)}%`;
+}
+
+function setCanvasZoomPercent(percent, viewAnchor = null) {
+    const bounded = Math.max(25, Math.min(800, Number(percent) || 100));
+    const anchorPoint = viewAnchor ? paper.view.viewToProject(viewAnchor) : null;
+    canvasZoomPercent = bounded;
+    paper.view.zoom = workspaceFitZoom * (canvasZoomPercent / 100);
+    if (viewAnchor && anchorPoint) {
+        const newAnchorPoint = paper.view.viewToProject(viewAnchor);
+        paper.view.center = paper.view.center.add(anchorPoint.subtract(newAnchorPoint));
+    }
+    updateZoomUi();
+}
+
+function initWorkspace(resetView = false) {
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+
+    if (machineBed) machineBed.remove();
+    machineBed = new paper.Path.Rectangle({
+        point: [0, 0],
+        size: [bedX, bedY],
+        strokeColor: '#007bff',
+        strokeWidth: 2,
+        dashArray: [5, 5],
+        name: 'machineBed'
+    });
+
+    if (originMarker) originMarker.remove();
+    originMarker = new paper.Path.Circle({
+        center: [0, 0],
+        radius: 4,
+        fillColor: 'red',
+        name: 'originMarker'
+    });
+
+    const pad = 40;
+    const scaleX = paper.view.viewSize.width / (bedX + pad);
+    const scaleY = paper.view.viewSize.height / (bedY + pad);
+    workspaceFitZoom = Math.min(scaleX, scaleY);
+    if (resetView) canvasZoomPercent = 100;
+    paper.view.zoom = workspaceFitZoom * (canvasZoomPercent / 100);
+    if (resetView || !paper.view.center) {
+        paper.view.center = new paper.Point(bedX / 2, bedY / 2);
+    }
+    updateZoomUi();
+}
+
+function getRotatedDimensions(width, height, rotationDegrees) {
+    const radians = (rotationDegrees * Math.PI) / 180;
+    const cosine = Math.abs(Math.cos(radians));
+    const sine = Math.abs(Math.sin(radians));
+    return {
+        width: (width * cosine) + (height * sine),
+        height: (width * sine) + (height * cosine)
+    };
+}
+
+function calculateFitScalePercent() {
+    if (!originalSVG) return 100;
+
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    const rotation = Number.parseFloat(document.getElementById('svgRotate').value) || 0;
+    const rotated = getRotatedDimensions(
+        Math.max(originalSVG.bounds.width, 0.0001),
+        Math.max(originalSVG.bounds.height, 0.0001),
+        rotation
+    );
+
+    return Math.min(
+        (bedX * FIT_MARGIN) / rotated.width,
+        (bedY * FIT_MARGIN) / rotated.height
+    ) * 100;
+}
+
+function getSvgSizeAtScale(scalePercent = 100) {
+    if (!originalSVG) return null;
+    const rotation = Number.parseFloat(document.getElementById('svgRotate').value) || 0;
+    const rotated = getRotatedDimensions(
+        originalSVG.bounds.width,
+        originalSVG.bounds.height,
+        rotation
+    );
+    const scale = scalePercent / 100;
+    return { width: rotated.width * scale, height: rotated.height * scale };
+}
+
+function offerAutoScaleToFit(reason = 'upload') {
+    if (!originalSVG) return false;
+
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    const scaleToCheck = reason === 'upload'
+        ? 100
+        : (Number.parseFloat(document.getElementById('svgScale').value) || 100);
+    const size = getSvgSizeAtScale(scaleToCheck);
+    if (!size || (size.width <= bedX && size.height <= bedY)) return false;
+
+    const fitScale = calculateFitScalePercent();
+    const context = reason === 'upload'
+        ? 'At 100% scale, this SVG'
+        : 'With the updated machine limits, the SVG';
+    const accepted = window.confirm(
+        `${context} is ${formatNumber(size.width)} × ${formatNumber(size.height)} mm, ` +
+        `which is larger than the ${formatNumber(bedX)} × ${formatNumber(bedY)} mm workspace.\n\n` +
+        `Auto-scale it to ${formatNumber(fitScale)}% so it fits with a 5% margin on each side?`
+    );
+
+    if (accepted) {
+        document.getElementById('svgScale').value = formatNumber(fitScale, 3);
+        document.getElementById('autoCenter').checked = true;
+        saveUiSettings();
+        centerSvgInWorkspace(false);
+        applyTransforms();
+        document.getElementById('generationStatus').textContent =
+            `SVG auto-scaled to ${formatNumber(fitScale)}% and centered.`;
+    } else {
+        const currentScale = Number.parseFloat(document.getElementById('svgScale').value) || 100;
+        const currentSize = getSvgSizeAtScale(currentScale);
+        const stillOversized = currentSize && (currentSize.width > bedX || currentSize.height > bedY);
+        document.getElementById('generationStatus').textContent = stillOversized
+            ? 'Auto-scale declined; geometry outside the machine limits will be clipped.'
+            : `Auto-scale declined; the existing ${formatNumber(currentScale)}% scale was retained.`;
+    }
+    return true;
+}
+
+restoreStoredSettings();
+if (document.getElementById('autoCenter').checked) setCenterInputs();
+initWorkspace(true);
+
+window.addEventListener('resize', () => initWorkspace(false));
+
+const canvasShell = document.querySelector('.canvas-shell');
+if (canvasShell && typeof ResizeObserver !== 'undefined') {
+    const canvasResizeObserver = new ResizeObserver(entries => {
+        const bounds = entries[0]?.contentRect;
+        if (!bounds || bounds.width < 1 || bounds.height < 1) return;
+        const width = Math.max(1, Math.round(bounds.width));
+        const height = Math.max(1, Math.round(bounds.height));
+        if (paper.view.viewSize.width === width && paper.view.viewSize.height === height) return;
+        paper.view.viewSize = new paper.Size(width, height);
+        initWorkspace(false);
+    });
+    canvasResizeObserver.observe(canvasShell);
+}
+
+['bedX', 'bedY'].forEach(id => {
+    const input = document.getElementById(id);
+    input.addEventListener('input', () => {
+        saveMachineSettings();
+        initWorkspace();
+        if (document.getElementById('autoCenter').checked) setCenterInputs();
+        applyTransforms();
+    });
+    input.addEventListener('change', () => offerAutoScaleToFit('machine-limit-change'));
+});
+
+MACHINE_SETTING_IDS.filter(id => !['bedX', 'bedY'].includes(id)).forEach(id => {
+    const input = document.getElementById(id);
+    input.addEventListener('input', saveMachineSettings);
+    input.addEventListener('change', saveMachineSettings);
+});
+
+document.getElementById('autoCenter').addEventListener('change', event => {
+    saveUiSettings();
+    if (event.target.checked) centerSvgInWorkspace();
+});
+
+document.getElementById('centerSvgBtn').addEventListener('click', () => {
+    document.getElementById('autoCenter').checked = true;
+    saveUiSettings();
+    centerSvgInWorkspace();
+});
+
+document.getElementById('enableAllLayersBtn').addEventListener('click', () => setAllLayersEnabled(true));
+document.getElementById('disableAllLayersBtn').addEventListener('click', () => setAllLayersEnabled(false));
+document.getElementById('autoPreviewGeneration').addEventListener('change', () => {
+    saveUiSettings();
+    syncSourceSvgVisibility();
+});
+document.getElementById('hideSvgDuringSimulation').addEventListener('change', () => {
+    saveUiSettings();
+    syncSourceSvgVisibility();
+});
+COLLAPSIBLE_SECTION_IDS.forEach(id => {
+    const section = document.getElementById(id);
+    if (!section) return;
+    section.addEventListener('toggle', () => {
+        saveUiSettings();
+        if (id === 'gcodeSection') window.setTimeout(() => initWorkspace(false), 0);
+    });
+});
+document.getElementById('zoomOutBtn').addEventListener('click', () => setCanvasZoomPercent(canvasZoomPercent / 1.25));
+document.getElementById('zoomInBtn').addEventListener('click', () => setCanvasZoomPercent(canvasZoomPercent * 1.25));
+document.getElementById('zoomFitBtn').addEventListener('click', () => {
+    paper.view.center = new paper.Point(readPositiveNumber('bedX', 210) / 2, readPositiveNumber('bedY', 297) / 2);
+    setCanvasZoomPercent(100);
+});
+document.getElementById('zoomSlider').addEventListener('input', event => setCanvasZoomPercent(event.target.value));
+document.getElementById('canvas').addEventListener('wheel', event => {
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const anchor = new paper.Point(event.clientX - rect.left, event.clientY - rect.top);
+    const factor = event.deltaY < 0 ? 1.12 : (1 / 1.12);
+    setCanvasZoomPercent(canvasZoomPercent * factor, anchor);
+}, { passive: false });
+renderLayerControls();
+
+// --- FILE UPLOAD ---
+document.getElementById('svgInput').addEventListener('change', function(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(loadEvent) {
+        if (originalSVG) originalSVG.remove();
+        if (workingSVG) workingSVG.remove();
+        if (originalSVGObjectUrl) URL.revokeObjectURL(originalSVGObjectUrl);
+        clearGeneratedPreview();
+
+        originalSVGText = String(loadEvent.target.result || '');
+        try {
+            const layerData = detectSvgLayers(originalSVGText);
+            originalSvgDocument = layerData.documentNode;
+            layerEntries = layerData.layers;
+            renderLayerControls();
+        } catch (error) {
+            originalSvgDocument = null;
+            layerEntries = [];
+            renderLayerControls();
+            generationStatus.textContent = error.message;
+            alert(error.message);
+            return;
+        }
+
+        const temporaryUrl = URL.createObjectURL(new Blob([originalSVGText], { type: 'image/svg+xml' }));
+        const image = new Image();
+
+        image.onload = async function() {
+            sourceSvgSizeMm = determineSvgPhysicalSize(originalSVGText, image);
+            if (document.getElementById('autoCenter').checked) setCenterInputs();
+            await reloadPreviewFromLayerSelection(true);
+            const prompted = offerAutoScaleToFit('upload');
+            if (!prompted) {
+                generationStatus.textContent = `Loaded SVG at ${formatNumber(sourceSvgSizeMm.width)} × ${formatNumber(sourceSvgSizeMm.height)} mm.`;
+            }
+            URL.revokeObjectURL(temporaryUrl);
+        };
+
+        image.onerror = function() {
+            URL.revokeObjectURL(temporaryUrl);
+            originalSVGImage = null;
+            sourceSvgSizeMm = null;
+            generationStatus.textContent = 'Unable to render the uploaded SVG in the browser.';
+            alert('The uploaded SVG could not be rendered. Check it for invalid XML or inaccessible external images.');
+        };
+        image.src = temporaryUrl;
+    };
+    reader.readAsText(file);
+});
+
+// --- SPATIAL TRANSFORMATIONS ---
+['svgScale', 'svgRotate'].forEach(id => {
+    document.getElementById(id).addEventListener('input', () => {
+        if (document.getElementById('autoCenter').checked) setCenterInputs();
+        applyTransforms();
+    });
+});
+
+['svgPosX', 'svgPosY'].forEach(id => {
+    document.getElementById(id).addEventListener('input', () => {
+        document.getElementById('autoCenter').checked = false;
+        saveUiSettings();
+        applyTransforms();
+    });
+});
+
+function applyTransforms() {
+    if (!originalSVG) return;
+
+    if (workingSVG) workingSVG.remove();
+    clearGeneratedPreview();
+
+    workingSVG = originalSVG.clone();
+    workingSVG.visible = true;
+    workingSVG.opacity = 0.5;
+
+    const scalePercent = Number.parseFloat(document.getElementById('svgScale').value) || 100;
+    const rotation = Number.parseFloat(document.getElementById('svgRotate').value) || 0;
+    const posX = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
+    const posY = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+
+    // Scale is now the SVG's actual percentage: 100% preserves its imported size.
+    // Auto-fit calculates and inserts the percentage required for the active bed.
+    const finalScale = scalePercent / 100;
+
+    workingSVG.pivot = workingSVG.bounds.center;
+    workingSVG.scale(finalScale);
+    workingSVG.rotate(rotation);
+    workingSVG.position = new paper.Point(posX, posY);
+    syncSourceSvgVisibility();
+}
+
+// --- API GENERATION ---
+const generateButton = document.getElementById('generateBtn');
+const cancelGenerateButton = document.getElementById('cancelGenerateBtn');
+const loadingOverlay = document.getElementById('loading');
+const loadingMessage = document.getElementById('loadingMessage');
+const loadingProgress = document.getElementById('loadingProgress');
+const loadingDetails = document.getElementById('loadingDetails');
+const generationStatus = document.getElementById('generationStatus');
+const gcodeOutput = document.getElementById('gcodeOutput');
+
+function sleep(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function readApiError(response) {
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+        const payload = await response.json().catch(() => ({}));
+        if (typeof payload.detail === 'string') return payload.detail;
+        if (payload.error) return payload.error;
+    }
+    const text = await response.text().catch(() => '');
+    return text || `Request failed with HTTP ${response.status}`;
+}
+
+function formatDuration(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value < 0) return null;
+    if (value < 60) return `${Math.max(0, Math.round(value))}s`;
+    const minutes = Math.floor(value / 60);
+    const remainingSeconds = Math.round(value % 60);
+    if (minutes < 60) return `${minutes}m ${remainingSeconds}s`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ${minutes % 60}m`;
+}
+
+function setLoading(message, percent = null, details = '') {
+    loadingMessage.textContent = message;
+    if (percent !== null && percent !== undefined && Number.isFinite(Number(percent))) {
+        loadingProgress.value = Math.max(0, Math.min(100, Number(percent)));
+    } else {
+        loadingProgress.removeAttribute('value');
+    }
+    loadingDetails.textContent = details;
+    const useLiveHud = Boolean(activeJobId) && document.getElementById('autoPreviewGeneration').checked;
+    loadingOverlay.classList.toggle('live-preview', useLiveHud);
+    loadingOverlay.style.display = 'flex';
+    updateGenerationButtons(true, Boolean(activeJobId) && !cancelRequested);
+}
+
+function showJobProgress(job) {
+    const progress = job.progress || {};
+    const percent = Number(progress.percent);
+    const elapsed = formatDuration(progress.elapsed_seconds);
+    const eta = formatDuration(progress.eta_seconds);
+    const backend = progress.compute_backend === 'cuda'
+        ? 'CUDA GPU'
+        : progress.compute_backend === 'numpy-cpu'
+            ? 'NumPy CPU'
+            : progress.compute_backend === 'geos-cpu'
+                ? 'GEOS CPU'
+                : null;
+    const work = Number(progress.total) > 0
+        ? `${Number(progress.completed || 0).toLocaleString()} / ${Number(progress.total).toLocaleString()}`
+        : null;
+    const previewText = Number(job.preview_total) > 0
+        ? `${Number(job.preview_total).toLocaleString()} live preview chunks`
+        : null;
+    const details = [
+        Number.isFinite(percent) ? `${percent.toFixed(1)}%` : null,
+        work,
+        eta !== null && Number(progress.eta_seconds) > 0 ? `about ${eta} remaining` : null,
+        elapsed ? `${elapsed} elapsed` : null,
+        previewText,
+        backend
+    ].filter(Boolean).join(' · ');
+    const message = progress.detail || (job.status === 'queued'
+        ? 'Waiting for the geometry worker...'
+        : 'Generating the toolpath...');
+    setLoading(message, Number.isFinite(percent) ? percent : null, details);
+    generationStatus.textContent = details ? `${message} ${details}` : message;
+}
+
+function updateGenerationButtons(isGenerating, canCancel = false) {
+    generateButton.disabled = isGenerating;
+    cancelGenerateButton.disabled = !(isGenerating && canCancel);
+}
+
+function clearLoading() {
+    loadingOverlay.style.display = 'none';
+    loadingOverlay.classList.remove('live-preview');
+    loadingProgress.removeAttribute('value');
+    loadingDetails.textContent = '';
+    updateGenerationButtons(false, false);
+}
+
+function setGcodeLines(lines) {
+    gcodeLines = Array.isArray(lines) ? lines.map(line => String(line)) : [];
+    gcodeLineOffsets = [];
+    let offset = 0;
+    for (const line of gcodeLines) {
+        gcodeLineOffsets.push(offset);
+        offset += line.length + 1;
+    }
+    gcodeOutput.value = gcodeLines.join('\n');
+}
+
+function highlightGcodeLine(lineIndex) {
+    if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= gcodeLines.length) return;
+    const start = gcodeLineOffsets[lineIndex] ?? 0;
+    const end = start + gcodeLines[lineIndex].length;
+    try {
+        if (document.activeElement !== gcodeOutput) gcodeOutput.focus({ preventScroll: true });
+        gcodeOutput.setSelectionRange(start, end);
+        const lineHeight = Number.parseFloat(window.getComputedStyle(gcodeOutput).lineHeight) || 18;
+        gcodeOutput.scrollTop = Math.max(0, (lineIndex * lineHeight) - (gcodeOutput.clientHeight / 2));
+    } catch (error) {
+        console.debug('Unable to highlight G-code line:', error);
+    }
+}
+
+function currentGcodeSettings() {
+    return {
+        zMode: document.getElementById('zMode').value,
+        zUp: document.getElementById('zUp').value,
+        zDown: document.getElementById('zDown').value,
+        xyFeedRate: Number.parseInt(document.getElementById('xyFeedRate').value, 10) || 2000,
+        zPlungeRate: Number.parseInt(document.getElementById('zPlungeRate').value, 10) || 300,
+    };
+}
+
+function buildGcodeHeader(settings) {
+    return [
+        'G21',
+        'G90',
+        settings.zMode === 'stepper' ? `G0 Z${settings.zUp}` : `M3 S${settings.zUp}`
+    ];
+}
+
+function appendGcodeForPaths(paths) {
+    const settings = currentGcodeSettings();
+    const lines = [...gcodeLines];
+    for (const path of paths) {
+        if (!Array.isArray(path) || path.length < 2) continue;
+        const rapidLine = lines.length;
+        lines.push(`G0 X${Number(path[0][0]).toFixed(2)} Y${Number(path[0][1]).toFixed(2)}`);
+        const penDownLine = lines.length;
+        lines.push(settings.zMode === 'stepper'
+            ? `G1 Z${settings.zDown} F${settings.zPlungeRate}`
+            : `M3 S${settings.zDown}`);
+        const moveStartLine = lines.length;
+        path.slice(1).forEach((point, pointIndex) => {
+            const feed = pointIndex === 0 ? ` F${settings.xyFeedRate}` : '';
+            lines.push(`G1 X${Number(point[0]).toFixed(2)} Y${Number(point[1]).toFixed(2)}${feed}`);
+        });
+        const penUpLine = lines.length;
+        lines.push(settings.zMode === 'stepper' ? `G0 Z${settings.zUp}` : `M3 S${settings.zUp}`);
+        generatedPathGcodeRanges.push({
+            rapidLine,
+            penDownLine,
+            moveStartLine,
+            moveCount: Math.max(0, path.length - 1),
+            penUpLine,
+        });
+    }
+    setGcodeLines(lines);
+}
+
+function calculateFinalGcodeRanges(paths) {
+    generatedPathGcodeRanges = [];
+    let lineIndex = 3;
+    for (const path of paths) {
+        const pointCount = Math.max(0, path.length - 1);
+        generatedPathGcodeRanges.push({
+            rapidLine: lineIndex,
+            penDownLine: lineIndex + 1,
+            moveStartLine: lineIndex + 2,
+            moveCount: pointCount,
+            penUpLine: lineIndex + 2 + pointCount,
+        });
+        lineIndex += pointCount + 3;
+    }
+}
+
+function canvasToBlob(canvas) {
+    return new Promise((resolve, reject) => {
+        try {
+            canvas.toBlob(blob => {
+                if (blob) resolve(blob);
+                else reject(new Error('The browser could not encode the SVG brightness map.'));
+            }, 'image/png');
+        } catch (error) {
+            reject(new Error(
+                'The SVG brightness map could not be read. Remove cross-origin external images or embed them as data URLs.'
+            ));
+        }
+    });
+}
+
+async function renderBrightnessMap(penThickness) {
+    if (!originalSVGImage || !sourceSvgSizeMm) {
+        throw new Error('The SVG preview has not finished loading.');
+    }
+
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    const desiredPixelSizeMm = Math.max(0.05, penThickness / 3);
+    let pixelsPerMm = 1 / desiredPixelSizeMm;
+    pixelsPerMm = Math.min(
+        pixelsPerMm,
+        MAX_BRIGHTNESS_MAP_DIMENSION / bedX,
+        MAX_BRIGHTNESS_MAP_DIMENSION / bedY
+    );
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.min(MAX_BRIGHTNESS_MAP_DIMENSION, Math.ceil(bedX * pixelsPerMm)));
+    canvas.height = Math.max(1, Math.min(MAX_BRIGHTNESS_MAP_DIMENSION, Math.ceil(bedY * pixelsPerMm)));
+    const context = canvas.getContext('2d', { alpha: false, willReadFrequently: false });
+    if (!context) throw new Error('The browser could not create the brightness-map canvas.');
+
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+
+    const scale = (Number.parseFloat(document.getElementById('svgScale').value) || 100) / 100;
+    const rotation = (Number.parseFloat(document.getElementById('svgRotate').value) || 0) * Math.PI / 180;
+    const posX = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
+    const posY = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+    const sourceWidthPixels = sourceSvgSizeMm.width * pixelsPerMm;
+    const sourceHeightPixels = sourceSvgSizeMm.height * pixelsPerMm;
+
+    context.save();
+    context.translate(posX * pixelsPerMm, posY * pixelsPerMm);
+    context.rotate(rotation);
+    context.scale(scale, scale);
+    context.drawImage(
+        originalSVGImage,
+        -sourceWidthPixels / 2,
+        -sourceHeightPixels / 2,
+        sourceWidthPixels,
+        sourceHeightPixels
+    );
+    context.restore();
+
+    return canvasToBlob(canvas);
+}
+
+async function buildGenerationFormData(penThickness) {
+    const fileInput = document.getElementById('svgInput');
+    const enabledLayerNames = getEnabledLayerNames();
+    if (!enabledLayerNames.length) {
+        throw new Error('Enable at least one SVG layer before generating a toolpath.');
+    }
+    const densityFudge = Number.parseFloat(document.getElementById('densityFudge').value);
+    if (!Number.isFinite(densityFudge) || densityFudge < -0.5 || densityFudge > 0.5) {
+        throw new Error('Density fudge must be between -0.5 and 0.5.');
+    }
+
+    const brightnessMap = await renderBrightnessMap(penThickness);
+    const formData = new FormData();
+    const filteredSvg = new Blob([serializeEnabledSvg()], { type: 'image/svg+xml' });
+    formData.append('file', filteredSvg, fileInput.files[0]?.name || 'filtered.svg');
+    formData.append('brightnessMap', brightnessMap, 'brightness-map.png');
+    formData.append('bedX', document.getElementById('bedX').value);
+    formData.append('bedY', document.getElementById('bedY').value);
+    formData.append('svgScale', document.getElementById('svgScale').value);
+    formData.append('svgScaleMode', 'absolute');
+    formData.append('svgRotate', document.getElementById('svgRotate').value);
+    formData.append('svgPosX', document.getElementById('svgPosX').value);
+    formData.append('svgPosY', document.getElementById('svgPosY').value);
+    formData.append('zMode', document.getElementById('zMode').value);
+    formData.append('zUp', document.getElementById('zUp').value);
+    formData.append('zDown', document.getElementById('zDown').value);
+    formData.append('xyFeedRate', document.getElementById('xyFeedRate').value);
+    formData.append('zPlungeRate', document.getElementById('zPlungeRate').value);
+    formData.append('penThickness', formatNumber(penThickness, 4));
+    formData.append('densityFudge', formatNumber(densityFudge, 3));
+    formData.append('enabledLayers', JSON.stringify(enabledLayerNames));
+    return formData;
+}
+
+function appendPaperPaths(paths, livePreview = false) {
+    const firstNewIndex = allGeneratedPaths.length;
+    for (const coords of paths) {
+        if (!Array.isArray(coords) || coords.length < 2) continue;
+        const path = new paper.Path();
+        coords.forEach(point => path.add(new paper.Point(point[0], point[1])));
+        path.strokeColor = livePreview ? '#ff8c00' : 'red';
+        path.strokeWidth = readPositiveNumber('penThickness', 0.5);
+        path.dashArray = [path.length, path.length];
+        path.dashOffset = path.length;
+        allGeneratedPaths.push(path);
+    }
+    return firstNewIndex;
+}
+
+function initializeLivePreview() {
+    clearGeneratedPreview(true);
+    generatedPathGcodeRanges = [];
+    setGcodeLines(buildGcodeHeader(currentGcodeSettings()));
+    livePreviewInitialized = true;
+    syncSourceSvgVisibility();
+}
+
+function consumeLivePreview(job) {
+    const autoPreview = document.getElementById('autoPreviewGeneration').checked;
+    const chunks = Array.isArray(job.preview) ? job.preview : [];
+    const nextCursor = Number.isInteger(job.preview_next) ? job.preview_next : livePreviewCursor;
+    if (!autoPreview || chunks.length === 0) {
+        livePreviewCursor = nextCursor;
+        return;
+    }
+    if (!livePreviewInitialized) initializeLivePreview();
+
+    for (const chunk of chunks) {
+        const paths = Array.isArray(chunk.paths) ? chunk.paths : [];
+        if (!paths.length) continue;
+        const firstNewIndex = appendPaperPaths(paths, true);
+        appendGcodeForPaths(paths);
+        if (simulationStoppedByUser) {
+            for (let index = firstNewIndex; index < allGeneratedPaths.length; index += 1) {
+                allGeneratedPaths[index].dashOffset = 0;
+            }
+        } else if (!isAnimating) {
+            startSimulation(firstNewIndex, false);
+        }
+    }
+    livePreviewCursor = nextCursor;
+}
+
+async function waitForGeneration(jobId) {
+    let transientFailures = 0;
+
+    while (true) {
+        try {
+            const previewAfter = Math.max(0, livePreviewCursor);
+            const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}?preview_after=${previewAfter}`, {
+                headers: { 'Accept': 'application/json' },
+                cache: 'no-store'
+            });
+            if (!response.ok) throw new Error(await readApiError(response));
+
+            transientFailures = 0;
+            const job = await response.json();
+            consumeLivePreview(job);
+            showJobProgress(job);
+            if (job.status === 'completed') return job;
+            if (job.status === 'failed' || job.status === 'cancelled') {
+                throw new Error(job.error || `Generation ${job.status}.`);
+            }
+            await sleep(500);
+        } catch (error) {
+            transientFailures += 1;
+            if (transientFailures >= 3 || cancelRequested) throw error;
+            setLoading('Backend connection interrupted; retrying...', null, `Retry ${transientFailures} of 3`);
+            await sleep(1200);
+        }
+    }
+}
+
+function displayGeneratedResult(data) {
+    clearGeneratedPreview(false, false);
+    setGcodeLines(String(data.gcode || '').split(/\r?\n/));
+    calculateFinalGcodeRanges(data.paths || []);
+    appendPaperPaths(data.paths || [], false);
+
+    const autoPreview = document.getElementById('autoPreviewGeneration').checked;
+    if (autoPreview && allGeneratedPaths.length && !simulationStoppedByUser) {
+        startSimulation(0, true);
+    } else {
+        allGeneratedPaths.forEach(path => { path.dashOffset = 0; });
+    }
+
+    const stats = data.stats || {};
+    generationStatus.textContent = [
+        `${Number(stats.continuous_paths || stats.hatch_paths || data.paths.length).toLocaleString()} continuous paths`,
+        stats.scanlines ? `${Number(stats.scanlines).toLocaleString()} brightness scanlines` : null,
+        stats.pen_thickness_mm ? `${formatNumber(Number(stats.pen_thickness_mm), 3)} mm pen` : null,
+        stats.density_fudge !== undefined ? `${Number(stats.density_fudge) >= 0 ? '+' : ''}${formatNumber(Number(stats.density_fudge), 2)} density fudge` : null,
+        stats.gcode_lines ? `${Number(stats.gcode_lines).toLocaleString()} G-code lines` : null,
+        stats.row_pitch_mm ? `${formatNumber(Number(stats.row_pitch_mm), 3)} mm row pitch` : null,
+        stats.sample_step_mm ? `${formatNumber(Number(stats.sample_step_mm), 3)} mm sample step` : null,
+        stats.compute_backend === 'cuda' ? 'CUDA GPU sampling' : stats.compute_backend ? `${stats.compute_backend} compute` : null,
+        stats.duration_seconds !== undefined ? `${stats.duration_seconds}s backend time` : null
+    ].filter(Boolean).join(' · ');
+}
+
+generateButton.addEventListener('click', async function() {
+    if (activeJobId) return;
+    const fileInput = document.getElementById('svgInput');
+    if (!fileInput.files.length) {
+        alert('Please upload an SVG.');
+        return;
+    }
+
+    clearGeneratedPreview(true);
+    livePreviewCursor = 0;
+    livePreviewInitialized = false;
+    generationStatus.textContent = '';
+
+    try {
+        const penThickness = ensurePenThickness();
+        setLoading('Rendering a brightness map from the transformed SVG...', 1, 'Preparing the exact machine-coordinate raster');
+        const formData = await buildGenerationFormData(penThickness);
+        setLoading('Uploading SVG and starting zig-zag generation...', 2, 'Starting the queued backend job');
+        const createResponse = await fetch('/api/jobs', {
+            method: 'POST',
+            body: formData,
+            headers: { 'Accept': 'application/json' }
+        });
+        if (!createResponse.ok) throw new Error(await readApiError(createResponse));
+
+        const created = await createResponse.json();
+        activeJobId = created.job_id;
+        cancelRequested = false;
+        updateGenerationButtons(true, true);
+        syncSourceSvgVisibility();
+        await waitForGeneration(created.job_id);
+
+        setLoading('Loading generated toolpath...', 99, 'Transferring G-code and final preview paths');
+        const resultResponse = await fetch(`/api/jobs/${encodeURIComponent(created.job_id)}/result`, {
+            headers: { 'Accept': 'application/json' },
+            cache: 'no-store'
+        });
+        if (!resultResponse.ok) throw new Error(await readApiError(resultResponse));
+
+        const data = await resultResponse.json();
+        displayGeneratedResult(data);
+    } catch (error) {
+        console.error('Failed to generate G-code:', error);
+        const cancelled = cancelRequested || /cancelled/i.test(String(error.message || ''));
+        generationStatus.textContent = cancelled
+            ? `Generation cancelled: ${error.message}`
+            : `Generation failed: ${error.message}`;
+        if (!cancelled) alert(`Unable to generate the toolpath:\n\n${error.message}`);
+    } finally {
+        activeJobId = null;
+        cancelRequested = false;
+        clearLoading();
+        syncSourceSvgVisibility();
+    }
+});
+
+cancelGenerateButton.addEventListener('click', async () => {
+    if (!activeJobId || cancelRequested) return;
+    cancelRequested = true;
+    updateGenerationButtons(true, false);
+    setLoading('Cancelling generation...', null, 'Waiting for the current worker step to stop safely');
+    try {
+        const response = await fetch(`/api/jobs/${encodeURIComponent(activeJobId)}`, {
+            method: 'DELETE',
+            headers: { 'Accept': 'application/json' }
+        });
+        if (!response.ok) throw new Error(await readApiError(response));
+        const result = await response.json();
+        generationStatus.textContent = result.cancelled
+            ? 'Generation cancelled before the job started.'
+            : 'Cancellation requested. Waiting for the worker to stop safely...';
+    } catch (error) {
+        cancelRequested = false;
+        updateGenerationButtons(true, true);
+        generationStatus.textContent = `Unable to cancel the current job: ${error.message}`;
+        alert(`Unable to cancel the current generation job:\n\n${error.message}`);
+    }
+});
+
+// --- SIMULATION LOOP ---
+function startSimulation(startIndex = 0, resetAll = true) {
+    if (allGeneratedPaths.length === 0 || startIndex >= allGeneratedPaths.length) {
+        updateSimulationControls();
+        return;
+    }
+
+    simulationStoppedByUser = false;
+
+    if (resetAll) {
+        allGeneratedPaths.forEach(path => {
+            if (path.length > 0) path.dashOffset = path.length;
+        });
+    } else {
+        for (let index = startIndex; index < allGeneratedPaths.length; index += 1) {
+            const path = allGeneratedPaths[index];
+            if (path.length > 0) path.dashOffset = path.length;
+        }
+    }
+
+    isAnimating = true;
+    updateSimulationControls();
+    syncSourceSvgVisibility();
+    currentPathIndex = Math.max(0, startIndex);
+    currentOffset = 0;
+    const firstPath = allGeneratedPaths[currentPathIndex];
+    if (!firstPath || !firstPath.firstSegment) {
+        isAnimating = false;
+        updateSimulationControls();
+        syncSourceSvgVisibility();
+        return;
+    }
+
+    if (penHead) penHead.remove();
+    penHead = new paper.Path.Circle({
+        center: firstPath.firstSegment.point,
+        radius: Math.max(readPositiveNumber('penThickness', 0.5) / 2, machineBed.bounds.width * 0.002),
+        fillColor: '#00ff00',
+        name: 'previewHead'
+    });
+    highlightGcodeLine(generatedPathGcodeRanges[currentPathIndex]?.rapidLine);
+}
+
+document.getElementById('simBtn').addEventListener('click', function() {
+    startSimulation(0, true);
+});
+
+function stopSimulation(markAsUserStop = true) {
+    if (markAsUserStop) simulationStoppedByUser = true;
+    isAnimating = false;
+    if (penHead) penHead.fillColor = 'gray';
+    updateSimulationControls();
+    syncSourceSvgVisibility();
+}
+
+document.getElementById('stopSimBtn').addEventListener('click', function() {
+    stopSimulation(true);
+    generationStatus.textContent = activeJobId
+        ? 'Simulation stopped. Toolpath generation is still running.'
+        : 'Simulation stopped.';
+});
+
+paper.view.onFrame = function() {
+    if (!isAnimating) return;
+
+    let activePath = allGeneratedPaths[currentPathIndex];
+    if (!activePath || activePath.length === 0) {
+        currentPathIndex += 1;
+        currentOffset = 0;
+        if (currentPathIndex >= allGeneratedPaths.length) {
+            isAnimating = false;
+            if (penHead) penHead.fillColor = 'gray';
+            updateSimulationControls();
+            syncSourceSvgVisibility();
+        }
+        return;
+    }
+
+    const range = generatedPathGcodeRanges[currentPathIndex];
+    const speed = Number.parseInt(document.getElementById('simSpeed').value, 10) || 20;
+    currentOffset += speed * (machineBed.bounds.width / 210);
+
+    if (currentOffset >= activePath.length) {
+        activePath.dashOffset = 0;
+        if (range) highlightGcodeLine(range.penUpLine);
+        currentPathIndex += 1;
+        currentOffset = 0;
+
+        if (currentPathIndex >= allGeneratedPaths.length) {
+            isAnimating = false;
+            if (penHead) penHead.fillColor = activeJobId ? '#00ff00' : 'gray';
+            updateSimulationControls();
+            syncSourceSvgVisibility();
+            return;
+        }
+
+        activePath = allGeneratedPaths[currentPathIndex];
+        if (activePath.length > 0 && activePath.firstSegment) {
+            if (penHead) penHead.position = activePath.firstSegment.point;
+            highlightGcodeLine(generatedPathGcodeRanges[currentPathIndex]?.rapidLine);
+        }
+        return;
+    }
+
+    activePath.dashOffset = activePath.length - currentOffset;
+    const location = activePath.getLocationAt(currentOffset);
+    if (!location) return;
+    if (penHead) penHead.position = location.point;
+    if (range) {
+        const curveIndex = location.curve && Number.isInteger(location.curve.index) ? location.curve.index : 0;
+        const moveIndex = Math.max(0, Math.min(range.moveCount - 1, curveIndex));
+        highlightGcodeLine(range.moveCount > 0 ? range.moveStartLine + moveIndex : range.penDownLine);
+    }
+};

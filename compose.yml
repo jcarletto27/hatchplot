@@ -1,0 +1,54 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: hatch-plotter-api
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      JOB_WORKERS: "${JOB_WORKERS:-1}"
+      MAX_PENDING_JOBS: "${MAX_PENDING_JOBS:-4}"
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-20971520}"
+      MAX_BRIGHTNESS_MAP_BYTES: "${MAX_BRIGHTNESS_MAP_BYTES:-20971520}"
+      MAX_BRIGHTNESS_MAP_PIXELS: "${MAX_BRIGHTNESS_MAP_PIXELS:-16777216}"
+      MIN_DRAW_DARKNESS: "${MIN_DRAW_DARKNESS:-0.025}"
+      MAX_HATCH_PATHS: "${MAX_HATCH_PATHS:-50000}"
+      MAX_TOOLPATH_POINTS: "${MAX_TOOLPATH_POINTS:-500000}"
+      MAX_RETAINED_RESULTS: "${MAX_RETAINED_RESULTS:-4}"
+      JOB_TTL_SECONDS: "${JOB_TTL_SECONDS:-1800}"
+      ACCELERATION_BACKEND: "${ACCELERATION_BACKEND:-auto}"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: hatch-plotter-ui
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
