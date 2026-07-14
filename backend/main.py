@@ -204,23 +204,27 @@ def _iter_lines(geometry: Any) -> Iterable[LineString]:
 
 
 def path_to_centerlines(element: Path, sample_step: float) -> list[LineString]:
-    """Sample SVG subpaths as open or closed centerlines for outline tracing."""
+    """Sample native SVG segments while preserving their exact vertices."""
     lines: list[LineString] = []
     safe_step = max(0.01, float(sample_step))
     for raw_subpath in element.as_subpaths():
         subpath = Path(raw_subpath)
-        length = float(subpath.length())
-        if not math.isfinite(length) or length <= 0.0:
-            continue
-        point_count = max(2, min(20_000, int(math.ceil(length / safe_step))))
         points: list[tuple[float, float]] = []
-        for index in range(point_count + 1):
-            point = subpath.point(index / point_count)
-            if not (math.isfinite(point.x) and math.isfinite(point.y)):
+        for segment in subpath:
+            try:
+                segment_length = float(segment.length())
+            except (AttributeError, TypeError, ValueError):
                 continue
-            coordinate = (float(point.x), float(point.y))
-            if not points or coordinate != points[-1]:
-                points.append(coordinate)
+            if not math.isfinite(segment_length) or segment_length <= 0.0:
+                continue
+            sample_count = max(1, min(20_000, int(math.ceil(segment_length / safe_step))))
+            for index in range(sample_count + 1):
+                point = segment.point(index / sample_count)
+                if not (math.isfinite(point.x) and math.isfinite(point.y)):
+                    continue
+                coordinate = (float(point.x), float(point.y))
+                if not points or coordinate != points[-1]:
+                    points.append(coordinate)
         if len(points) >= 2:
             lines.append(LineString(points))
     return lines
@@ -1391,7 +1395,7 @@ def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
         f"; SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({display_svg_x:.3f}, {display_svg_y:.3f}) mm",
     ]
     if generation_mode == "outline":
-        lines.append("; Outline: traces the browser-rendered SVG; thin linework becomes centerlines and filled artwork becomes boundaries")
+        lines.append("; Outline: traces native SVG vector geometry; stroked paths follow their centerlines and filled shapes follow their vector boundaries")
     else:
         lines.extend([
             f"; Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
@@ -1479,53 +1483,6 @@ def generate_toolpath(
             total=len(compiled_paths),
             detail="Toolpath generation completed.",
             compute_backend=raster_stats.get("compute_backend"),
-            force_eta_zero=True,
-        )
-        return result
-
-    if generation_mode == "outline" and brightness_map is not None:
-        compiled_paths, outline_stats = _generate_outline_paths_from_raster(
-            brightness_map, params, progress, preview_queue
-        )
-        _set_progress(
-            progress,
-            phase="gcode",
-            percent=94.0,
-            completed=0,
-            total=len(compiled_paths),
-            detail="Compiling visible outline paths into G-code...",
-            compute_backend=outline_stats.get("compute_backend"),
-        )
-        _check_cancel_requested(progress)
-        gcode = _compile_gcode(compiled_paths, params)
-        duration = time.perf_counter() - started
-        toolpath_points = sum(len(path) for path in compiled_paths)
-        result = {
-            "gcode": "\n".join(gcode),
-            "paths": compiled_paths,
-            "stats": {
-                "duration_seconds": round(duration, 3),
-                "drawable_elements": None,
-                "hatch_paths": 0,
-                "outline_paths": len(compiled_paths),
-                "continuous_paths": len(compiled_paths),
-                "generation_mode": generation_mode,
-                "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
-                "toolpath_points": toolpath_points,
-                "gcode_lines": len(gcode),
-                "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
-                "pen_thickness_mm": float(params.get("penThickness", 0.5)),
-                **outline_stats,
-            },
-        }
-        _set_progress(
-            progress,
-            phase="completed",
-            percent=100.0,
-            completed=len(compiled_paths),
-            total=len(compiled_paths),
-            detail="Visible outline tracing completed.",
-            compute_backend=outline_stats.get("compute_backend"),
             force_eta_zero=True,
         )
         return result
@@ -1643,10 +1600,14 @@ def generate_toolpath(
                 continue
             drawable_elements += 1
             transformed_lines: list[LineString] = []
+            simplify_tolerance = max(0.01, float(params.get("penThickness", 0.5)) * 0.04)
             for source_geometry in source_geometries:
                 transformed = _transform_svg_geometry(source_geometry, source_center, scale, rotation, destination)
                 clipped = transformed.intersection(machine_bed)
-                transformed_lines.extend(_iter_lines(clipped))
+                for clipped_line in _iter_lines(clipped):
+                    simplified = clipped_line.simplify(simplify_tolerance, preserve_topology=False)
+                    if isinstance(simplified, LineString) and not simplified.is_empty and len(simplified.coords) >= 2:
+                        transformed_lines.append(simplified)
             clipped_grid: Any = MultiLineString(transformed_lines) if transformed_lines else MultiLineString([])
         else:
             polygon = path_to_shapely(path_element)
@@ -1741,7 +1702,11 @@ def generate_toolpath(
             "brightness_cutoff": float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF)),
         })
     else:
-        stats["outline_sampling_mm"] = max(0.05, float(params.get("penThickness", 0.5)) * 0.35)
+        stats.update({
+            "outline_sampling_mm": max(0.05, float(params.get("penThickness", 0.5)) * 0.35),
+            "outline_trace_source": "svg-vector-geometry",
+            "outline_trace_method": "vector-boundary",
+        })
 
     result = {
         "gcode": "\n".join(gcode),
