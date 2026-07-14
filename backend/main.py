@@ -273,6 +273,24 @@ def validate_generation_params(params: dict[str, Any]) -> None:
     if not math.isfinite(brightness_cutoff) or not 0.0 <= brightness_cutoff <= 1.0:
         raise GenerationError("brightnessCutoff must be between 0.0 and 1.0.")
 
+    if params.get("patternLayout", "linear") not in {"linear", "spiral", "concentric", "radial"}:
+        raise GenerationError("patternLayout must be linear, spiral, concentric, or radial.")
+    if params.get("waveform", "zigzag") not in {"zigzag", "sawtooth", "sine", "ekg", "straight"}:
+        raise GenerationError("waveform must be zigzag, sawtooth, sine, ekg, or straight.")
+    if params.get("brightnessModulation", "both") not in {"both", "amplitude", "frequency", "none"}:
+        raise GenerationError("brightnessModulation must be both, amplitude, frequency, or none.")
+    for key, minimum, maximum in (
+        ("patternSpacing", 0.05, 500.0),
+        ("waveAmplitude", 0.0, 500.0),
+        ("waveLength", 0.05, 5000.0),
+    ):
+        value = float(params.get(key, minimum))
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise GenerationError(f"{key} must be between {minimum} and {maximum} mm.")
+    for key in ("patternCenterX", "patternCenterY", "patternAngle"):
+        if not math.isfinite(float(params.get(key, 0.0))):
+            raise GenerationError(f"{key} must be a finite number.")
+
     for key in ("svgRotate", "svgPosX", "svgPosY"):
         if not math.isfinite(float(params[key])):
             raise GenerationError(f"{key} must be a finite number.")
@@ -530,6 +548,195 @@ def _publish_live_preview(
     flush_chunk()
 
 
+
+def _waveform_value(waveform: str, phase: float) -> float:
+    wrapped = phase % 1.0
+    if waveform == "straight":
+        return 0.0
+    if waveform == "sine":
+        return math.sin(wrapped * math.tau)
+    if waveform == "sawtooth":
+        return (2.0 * wrapped) - 1.0
+    if waveform == "ekg":
+        # Stylized P-QRS-T cycle with a mostly flat baseline.
+        keyframes = (
+            (0.00, 0.00), (0.12, 0.00), (0.18, 0.18), (0.24, 0.00),
+            (0.34, 0.00), (0.39, -0.22), (0.43, 1.00), (0.47, -0.52),
+            (0.53, 0.00), (0.68, 0.00), (0.78, 0.32), (0.88, 0.00),
+            (1.00, 0.00),
+        )
+        for index in range(len(keyframes) - 1):
+            x0, y0 = keyframes[index]
+            x1, y1 = keyframes[index + 1]
+            if x0 <= wrapped <= x1:
+                ratio = (wrapped - x0) / max(x1 - x0, 1e-9)
+                return y0 + ((y1 - y0) * ratio)
+        return 0.0
+    return _triangle_wave(wrapped)
+
+
+def _sample_segment(start: tuple[float, float], end: tuple[float, float], step: float) -> list[tuple[float, float]]:
+    distance = math.dist(start, end)
+    count = max(1, int(math.ceil(distance / max(step, 0.01))))
+    return [
+        (
+            start[0] + ((end[0] - start[0]) * (index / count)),
+            start[1] + ((end[1] - start[1]) * (index / count)),
+        )
+        for index in range(count + 1)
+    ]
+
+
+def _build_pattern_carriers(
+    layout: str,
+    bed_x: float,
+    bed_y: float,
+    center_x: float,
+    center_y: float,
+    spacing: float,
+    sample_step: float,
+    angle_degrees: float,
+    clockwise: bool,
+) -> list[list[tuple[float, float]]]:
+    center = (center_x, center_y)
+    corners = ((0.0, 0.0), (bed_x, 0.0), (bed_x, bed_y), (0.0, bed_y))
+    maximum_radius = max(math.dist(center, corner) for corner in corners) + spacing
+    carriers: list[list[tuple[float, float]]] = []
+
+    if layout == "spiral":
+        direction = -1.0 if clockwise else 1.0
+        theta = 0.0
+        points: list[tuple[float, float]] = []
+        radial_per_radian = spacing / math.tau
+        maximum_theta = maximum_radius / max(radial_per_radian, 1e-9)
+        while theta <= maximum_theta:
+            radius = radial_per_radian * theta
+            x = center_x + (radius * math.cos(direction * theta))
+            y = center_y + (radius * math.sin(direction * theta))
+            points.append((x, y))
+            arc_derivative = math.hypot(radial_per_radian, radius)
+            theta += sample_step / max(arc_derivative, sample_step)
+        if len(points) >= 2:
+            carriers.append(points)
+        return carriers
+
+    if layout == "concentric":
+        radius = max(spacing * 0.5, sample_step)
+        ring_index = 0
+        while radius <= maximum_radius:
+            count = max(12, int(math.ceil((math.tau * radius) / sample_step)))
+            direction = -1.0 if clockwise ^ (ring_index % 2 == 1) else 1.0
+            points = [
+                (
+                    center_x + (radius * math.cos(direction * math.tau * index / count)),
+                    center_y + (radius * math.sin(direction * math.tau * index / count)),
+                )
+                for index in range(count + 1)
+            ]
+            carriers.append(points)
+            radius += spacing
+            ring_index += 1
+        return carriers
+
+    if layout == "radial":
+        circumference = max(math.tau * maximum_radius, spacing)
+        spoke_count = max(3, int(math.ceil(circumference / spacing)))
+        direction = -1.0 if clockwise else 1.0
+        start_angle = math.radians(angle_degrees)
+        for index in range(spoke_count):
+            angle = start_angle + (direction * math.tau * index / spoke_count)
+            outer = (
+                center_x + (maximum_radius * math.cos(angle)),
+                center_y + (maximum_radius * math.sin(angle)),
+            )
+            points = _sample_segment(center, outer, sample_step)
+            if index % 2 == 1:
+                points.reverse()
+            carriers.append(points)
+        return carriers
+
+    # Linear parallel carriers. The selected center acts as the pattern origin.
+    angle = math.radians(angle_degrees)
+    tangent = (math.cos(angle), math.sin(angle))
+    normal = (-tangent[1], tangent[0])
+    diagonal = math.hypot(bed_x, bed_y) * 1.25
+    offset = -diagonal
+    line_index = 0
+    while offset <= diagonal:
+        line_center = (center_x + (normal[0] * offset), center_y + (normal[1] * offset))
+        start = (line_center[0] - (tangent[0] * diagonal), line_center[1] - (tangent[1] * diagonal))
+        end = (line_center[0] + (tangent[0] * diagonal), line_center[1] + (tangent[1] * diagonal))
+        points = _sample_segment(start, end, sample_step)
+        if line_index % 2 == 1:
+            points.reverse()
+        carriers.append(points)
+        offset += spacing
+        line_index += 1
+    return carriers
+
+
+def _sample_carrier_darkness(
+    rgba: Image.Image,
+    carriers: list[list[tuple[float, float]]],
+    bed_x: float,
+    bed_y: float,
+    progress: MutableMapping[str, Any] | None,
+) -> tuple[list[np.ndarray], str]:
+    lengths = [len(carrier) for carrier in carriers]
+    flat_points = [point for carrier in carriers for point in carrier]
+    if not flat_points:
+        return [], "numpy-cpu"
+
+    source = np.asarray(rgba, dtype=np.uint8)
+    coordinates = np.asarray(flat_points, dtype=np.float64)
+    x_indices = np.rint((coordinates[:, 0] / bed_x) * (rgba.width - 1)).astype(np.int32)
+    y_indices = np.rint((coordinates[:, 1] / bed_y) * (rgba.height - 1)).astype(np.int32)
+    inside = (
+        (coordinates[:, 0] >= 0.0) & (coordinates[:, 0] <= bed_x) &
+        (coordinates[:, 1] >= 0.0) & (coordinates[:, 1] <= bed_y)
+    )
+    x_indices = np.clip(x_indices, 0, rgba.width - 1)
+    y_indices = np.clip(y_indices, 0, rgba.height - 1)
+
+    requested = ACCELERATION_BACKEND
+    backend = "numpy-cpu"
+    darkness: np.ndarray
+    if requested in {"auto", "cuda"}:
+        try:
+            import cupy as cp  # type: ignore
+            if cp.cuda.runtime.getDeviceCount() < 1:
+                raise RuntimeError("no CUDA devices were detected")
+            _set_progress(progress, phase="gpu-sampling", percent=7.0, detail="Sampling pattern brightness on the CUDA GPU...", compute_backend="cuda")
+            gpu_source = cp.asarray(source)
+            samples = gpu_source[cp.asarray(y_indices), cp.asarray(x_indices)].astype(cp.float64)
+            luminance = (0.299 * samples[:, 0] + 0.587 * samples[:, 1] + 0.114 * samples[:, 2]) / 255.0
+            gpu_darkness = (1.0 - luminance) * (samples[:, 3] / 255.0)
+            darkness = cp.asnumpy(cp.clip(gpu_darkness, 0.0, 1.0))
+            del gpu_source, samples, luminance, gpu_darkness
+            cp.get_default_memory_pool().free_all_blocks()
+            backend = "cuda"
+        except Exception as exc:
+            if requested == "cuda":
+                raise GenerationError(f"CUDA acceleration was requested but is unavailable: {exc}") from exc
+            logger.info("CUDA pattern sampling unavailable; using NumPy CPU path: %s", exc)
+            samples = source[y_indices, x_indices].astype(np.float64)
+            luminance = (0.299 * samples[:, 0] + 0.587 * samples[:, 1] + 0.114 * samples[:, 2]) / 255.0
+            darkness = np.clip((1.0 - luminance) * (samples[:, 3] / 255.0), 0.0, 1.0)
+    else:
+        _set_progress(progress, phase="cpu-sampling", percent=7.0, detail="Sampling pattern brightness with NumPy...", compute_backend="numpy-cpu")
+        samples = source[y_indices, x_indices].astype(np.float64)
+        luminance = (0.299 * samples[:, 0] + 0.587 * samples[:, 1] + 0.114 * samples[:, 2]) / 255.0
+        darkness = np.clip((1.0 - luminance) * (samples[:, 3] / 255.0), 0.0, 1.0)
+    darkness[~inside] = 0.0
+
+    result: list[np.ndarray] = []
+    cursor = 0
+    for length in lengths:
+        result.append(darkness[cursor:cursor + length])
+        cursor += length
+    return result, backend
+
+
 def _generate_brightness_paths(
     brightness_map: bytes,
     params: dict[str, Any],
@@ -541,236 +748,153 @@ def _generate_brightness_paths(
     pen_thickness = float(params.get("penThickness", 0.5))
     density_fudge = float(params.get("densityFudge", 0.0))
     brightness_cutoff = float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF))
+    layout = str(params.get("patternLayout", "linear"))
+    waveform = str(params.get("waveform", "zigzag"))
+    center_x = float(params.get("patternCenterX", bed_x / 2.0))
+    center_y = float(params.get("patternCenterY", bed_y / 2.0))
+    angle_degrees = float(params.get("patternAngle", 0.0))
+    clockwise = bool(params.get("patternClockwise", True))
+    brightness_mode = str(params.get("brightnessModulation", "both"))
     density_scale = 1.0 - (density_fudge * 0.8)
+    layout_spacing = max(pen_thickness, float(params.get("patternSpacing", pen_thickness * 1.55)) * density_scale)
+    wave_amplitude = max(0.0, float(params.get("waveAmplitude", layout_spacing * 0.42)))
+    wave_length = max(pen_thickness * 2.0, float(params.get("waveLength", pen_thickness * 6.0)) * density_scale)
 
-    _set_progress(
-        progress,
-        phase="decoding",
-        percent=2.0,
-        detail="Decoding the browser brightness map...",
-    )
+    _set_progress(progress, phase="decoding", percent=2.0, detail="Decoding the browser brightness map...")
     _check_cancel_requested(progress)
     try:
         image = Image.open(io.BytesIO(brightness_map))
+        image.load()
     except (UnidentifiedImageError, OSError) as exc:
         raise GenerationError(f"Unable to read the generated brightness map: {exc}") from exc
-
-    if image.width <= 0 or image.height <= 0:
-        raise GenerationError("The generated brightness map is empty.")
     if image.width * image.height > MAX_BRIGHTNESS_MAP_PIXELS:
-        raise GenerationLimitError(
-            f"The brightness map contains more than {MAX_BRIGHTNESS_MAP_PIXELS:,} pixels. "
-            "Use a thicker pen or smaller machine limits."
-        )
-    try:
-        image.load()
-    except OSError as exc:
-        raise GenerationError(f"Unable to decode the generated brightness map: {exc}") from exc
+        raise GenerationLimitError(f"The brightness map contains more than {MAX_BRIGHTNESS_MAP_PIXELS:,} pixels.")
 
     rgba = image.convert("RGBA")
-    pixels = rgba.load()
-    pixel_mm_x = bed_x / max(1, rgba.width - 1)
-    pixel_mm_y = bed_y / max(1, rgba.height - 1)
-
-    # The scan pitch is derived from the physical pen width. Adjacent rows are
-    # connected in alternating directions to form a continuous boustrophedon
-    # zig-zag wherever the image mask remains drawable.
-    row_pitch = max(pen_thickness, pen_thickness * 1.55 * density_scale, pixel_mm_y, 0.075)
-    row_count = max(1, int(math.floor(bed_y / row_pitch)) + 1)
-    sample_step = max(pen_thickness * 0.5, pen_thickness * 0.75 * density_scale, pixel_mm_x, 0.05)
-
-    # Keep sampling bounded before building Python point objects. This preserves
-    # local brightness detail while respecting the configured toolpath limit.
-    estimated_samples = row_count * (int(math.ceil(bed_x / sample_step)) + 1)
-    target_samples = max(10_000, int(MAX_TOOLPATH_POINTS * 0.8))
-    if estimated_samples > target_samples:
-        sample_step *= estimated_samples / target_samples
-
-    x_values: list[float] = []
-    x = 0.0
-    while x < bed_x:
-        x_values.append(x)
-        x += sample_step
-    x_values.append(bed_x)
-    row_positions = [min(bed_y, row_index * row_pitch) for row_index in range(row_count)]
-
-    darkness_grid, compute_backend = _build_darkness_grid(
-        rgba,
-        x_values,
-        row_positions,
-        bed_x,
-        bed_y,
-        progress,
+    pixel_mm = max(bed_x / max(1, rgba.width - 1), bed_y / max(1, rgba.height - 1))
+    sample_step = max(pen_thickness * 0.5, pixel_mm, 0.05)
+    carriers = _build_pattern_carriers(
+        layout, bed_x, bed_y, center_x, center_y, layout_spacing,
+        sample_step, angle_degrees, clockwise,
     )
+    estimated_points = sum(len(carrier) for carrier in carriers)
+    if estimated_points > MAX_TOOLPATH_POINTS * 2:
+        scale = estimated_points / max(MAX_TOOLPATH_POINTS * 1.5, 1)
+        sample_step *= scale
+        carriers = _build_pattern_carriers(
+            layout, bed_x, bed_y, center_x, center_y, layout_spacing,
+            sample_step, angle_degrees, clockwise,
+        )
+
+    darkness_sets, compute_backend = _sample_carrier_darkness(rgba, carriers, bed_x, bed_y, progress)
+    total_carriers = len(carriers)
     _set_progress(
-        progress,
-        phase="path-building",
-        percent=10.0,
-        completed=0,
-        total=row_count,
-        detail="Building the continuous brightness zig-zag...",
-        compute_backend=compute_backend,
+        progress, phase="path-building", percent=10.0, completed=0, total=total_carriers,
+        detail=f"Building {layout} {waveform} paths...", compute_backend=compute_backend,
     )
-
-    max_amplitude = row_pitch * 0.42
-    minimum_wavelength = max(pen_thickness * 2.2 * density_scale, sample_step * 2.0)
-    maximum_wavelength = max(pen_thickness * 9.0 * density_scale, minimum_wavelength)
 
     preview_state = {"points": 0, "chunks": 0}
-    preview_pending: list[list[list[float]]] = []
     completed_paths: list[list[list[float]]] = []
-    active_chains: list[list[list[float]]] = []
-    scanline_count = 0
+    preview_pending: list[list[list[float]]] = []
     sampled_points = 0
-    progress_stride = max(1, row_count // 150)
-    limit_check_stride = max(1, row_count // 100)
+    progress_stride = max(1, total_carriers // 150)
 
-    for row_index, base_y in enumerate(row_positions):
-        if row_index % max(1, progress_stride // 2) == 0 or row_index + 1 == row_count:
+    for carrier_index, (carrier, darkness_values) in enumerate(zip(carriers, darkness_sets, strict=True)):
+        if carrier_index % progress_stride == 0 or carrier_index + 1 == total_carriers:
             _check_cancel_requested(progress)
-        left_to_right = row_index % 2 == 0
-        row_x_values = x_values if left_to_right else reversed(x_values)
-        row_darkness_values = darkness_grid[row_index] if left_to_right else darkness_grid[row_index, ::-1]
-
-        runs: list[list[list[float]]] = []
         current_run: list[list[float]] = []
         phase = 0.0
-        previous_x: float | None = None
+        previous_point: tuple[float, float] | None = None
 
-        for x, darkness_value in zip(row_x_values, row_darkness_values, strict=True):
-            darkness = max(0.0, min(1.0, float(darkness_value) * (1.0 + density_fudge)))
+        for point_index, (point, raw_darkness) in enumerate(zip(carrier, darkness_values, strict=True)):
+            darkness = max(0.0, min(1.0, float(raw_darkness) * (1.0 + density_fudge)))
             sampled_points += 1
             if darkness < brightness_cutoff:
                 if len(current_run) >= 2:
-                    runs.append(current_run)
+                    completed_paths.append(current_run)
+                    preview_pending.append(current_run)
                 current_run = []
+                previous_point = None
                 phase = 0.0
-                previous_x = None
                 continue
 
-            if previous_x is not None:
-                distance = abs(x - previous_x)
-                wavelength = maximum_wavelength - ((maximum_wavelength - minimum_wavelength) * darkness)
-                phase += distance / max(wavelength, 0.001)
-            previous_x = x
+            if previous_point is not None:
+                distance = math.dist(previous_point, point)
+                local_wave_length = wave_length
+                if brightness_mode in {"frequency", "both"}:
+                    local_wave_length = max(pen_thickness * 2.0, wave_length * (1.5 - darkness))
+                phase += distance / max(local_wave_length, 0.001)
+            previous_point = point
 
-            # Darker pixels produce both a taller and tighter zig-zag, adding
-            # more ink per square millimeter without changing pen pressure.
-            offset = _triangle_wave(phase) * max_amplitude * darkness
-            point_y = min(bed_y, max(0.0, base_y + offset))
-            current_run.append([round(x, 4), round(point_y, 4)])
+            before = carrier[max(0, point_index - 1)]
+            after = carrier[min(len(carrier) - 1, point_index + 1)]
+            tangent_x = after[0] - before[0]
+            tangent_y = after[1] - before[1]
+            tangent_length = math.hypot(tangent_x, tangent_y) or 1.0
+            normal_x = -tangent_y / tangent_length
+            normal_y = tangent_x / tangent_length
+            local_amplitude = wave_amplitude * (darkness if brightness_mode in {"amplitude", "both"} else 1.0)
+            offset = _waveform_value(waveform, phase) * local_amplitude
+            x = point[0] + (normal_x * offset)
+            y = point[1] + (normal_y * offset)
+            if not (0.0 <= x <= bed_x and 0.0 <= y <= bed_y):
+                if len(current_run) >= 2:
+                    completed_paths.append(current_run)
+                    preview_pending.append(current_run)
+                current_run = []
+                continue
+            current_run.append([round(x, 4), round(y, 4)])
 
         if len(current_run) >= 2:
-            runs.append(current_run)
-        if runs:
-            preview_pending.extend(runs)
-            pending_points = sum(len(path) for path in preview_pending)
-            if pending_points >= LIVE_PREVIEW_CHUNK_POINTS or row_index % progress_stride == 0:
-                _publish_live_preview(preview_queue, preview_pending, preview_state)
-                preview_pending = []
-        if not runs:
-            completed_paths.extend(active_chains)
-            active_chains = []
-        else:
-            scanline_count += 1
-            unmatched_chains = set(range(len(active_chains)))
-            next_active: list[list[list[float]]] = []
+            completed_paths.append(current_run)
+            preview_pending.append(current_run)
 
-            for run in runs:
-                best_match: tuple[float, int, bool] | None = None
-                for chain_index in unmatched_chains:
-                    chain_end = active_chains[chain_index][-1]
-                    for reverse_run in (False, True):
-                        run_start = run[-1] if reverse_run else run[0]
-                        distance = math.dist(chain_end, run_start)
-                        if best_match is None or distance < best_match[0]:
-                            if _connector_is_drawable(
-                                pixels,
-                                rgba.width,
-                                rgba.height,
-                                bed_x,
-                                bed_y,
-                                (chain_end[0], chain_end[1]),
-                                (run_start[0], run_start[1]),
-                                pen_thickness,
-                                brightness_cutoff,
-                            ):
-                                best_match = (distance, chain_index, reverse_run)
+        if sum(len(path) for path in preview_pending) >= LIVE_PREVIEW_CHUNK_POINTS:
+            _publish_live_preview(preview_queue, preview_pending, preview_state)
+            preview_pending = []
+        if len(completed_paths) > MAX_HATCH_PATHS:
+            raise GenerationLimitError(f"The pattern generated more than {MAX_HATCH_PATHS:,} disconnected paths.")
+        if sum(len(path) for path in completed_paths) > MAX_TOOLPATH_POINTS:
+            raise GenerationLimitError(f"The pattern exceeded {MAX_TOOLPATH_POINTS:,} toolpath points.")
 
-                if best_match is None:
-                    next_active.append(run)
-                    continue
-
-                _, chain_index, reverse_run = best_match
-                unmatched_chains.remove(chain_index)
-                chain = active_chains[chain_index]
-                oriented_run = list(reversed(run)) if reverse_run else run
-                if chain[-1] != oriented_run[0]:
-                    chain.append(oriented_run[0])
-                chain.extend(oriented_run[1:])
-                next_active.append(chain)
-
-            for chain_index in unmatched_chains:
-                completed_paths.append(active_chains[chain_index])
-            active_chains = next_active
-
-        if row_index % limit_check_stride == 0 or row_index + 1 == row_count:
-            point_total = sum(len(path) for path in completed_paths) + sum(len(path) for path in active_chains)
-            if point_total > MAX_TOOLPATH_POINTS:
-                raise GenerationLimitError(
-                    f"The brightness-driven zig-zag exceeded {MAX_TOOLPATH_POINTS:,} toolpath points. "
-                    "Increase the pen thickness or reduce the machine limits."
-                )
-            if len(completed_paths) + len(active_chains) > MAX_HATCH_PATHS:
-                raise GenerationLimitError(
-                    f"The image generated more than {MAX_HATCH_PATHS:,} disconnected drawing paths. "
-                    "Simplify the artwork or increase the pen thickness."
-                )
-
-        if row_index % progress_stride == 0 or row_index + 1 == row_count:
-            fraction = (row_index + 1) / row_count
+        if carrier_index % progress_stride == 0 or carrier_index + 1 == total_carriers:
+            fraction = (carrier_index + 1) / max(total_carriers, 1)
             _set_progress(
-                progress,
-                phase="path-building",
-                percent=10.0 + (fraction * 80.0),
-                completed=row_index + 1,
-                total=row_count,
-                detail=f"Building scanline {row_index + 1:,} of {row_count:,}...",
+                progress, phase="path-building", percent=10.0 + (fraction * 80.0),
+                completed=carrier_index + 1, total=total_carriers,
+                detail=f"Building carrier {carrier_index + 1:,} of {total_carriers:,}...",
                 compute_backend=compute_backend,
             )
 
     _publish_live_preview(preview_queue, preview_pending, preview_state)
-    completed_paths.extend(active_chains)
     completed_paths = [path for path in completed_paths if len(path) >= 2]
     if not completed_paths:
-        raise GenerationError(
-            "The transformed SVG contains no pixels dark enough to draw. "
-            "Check its placement, opacity, and colors, or lower the brightness cutoff."
-        )
-    _set_progress(
-        progress,
-        phase="path-building",
-        percent=92.0,
-        completed=row_count,
-        total=row_count,
-        detail="Continuous paths are ready; compiling G-code...",
-        compute_backend=compute_backend,
-    )
+        raise GenerationError("The transformed SVG contains no pixels above the brightness cutoff.")
+
+    _set_progress(progress, phase="path-building", percent=92.0, completed=total_carriers, total=total_carriers, detail="Pattern paths are ready; compiling G-code...", compute_backend=compute_backend)
     return completed_paths, {
         "source": "browser-brightness-map",
         "map_width": rgba.width,
         "map_height": rgba.height,
-        "scanlines": scanline_count,
+        "carrier_count": total_carriers,
         "sample_step_mm": round(sample_step, 4),
-        "row_pitch_mm": round(row_pitch, 4),
+        "pattern_spacing_mm": round(layout_spacing, 4),
         "sampled_points": sampled_points,
         "compute_backend": compute_backend,
         "gpu_accelerated": compute_backend == "cuda",
         "density_fudge": density_fudge,
         "brightness_cutoff": brightness_cutoff,
+        "pattern_layout": layout,
+        "waveform": waveform,
+        "pattern_center_x": center_x,
+        "pattern_center_y": center_y,
+        "pattern_angle": angle_degrees,
+        "pattern_clockwise": clockwise,
+        "wave_amplitude_mm": wave_amplitude,
+        "wave_length_mm": wave_length,
+        "brightness_modulation": brightness_mode,
         "live_preview_points": preview_state["points"],
     }
-
 
 def _compile_gcode(paths: list[list[list[float]]], params: dict[str, Any]) -> list[str]:
     z_mode = str(params["zMode"])
@@ -1181,6 +1305,16 @@ def _params_from_form(
     penThickness: float,
     densityFudge: float,
     brightnessCutoff: float,
+    patternLayout: str,
+    waveform: str,
+    patternCenterX: float,
+    patternCenterY: float,
+    patternAngle: float,
+    patternSpacing: float,
+    patternClockwise: bool,
+    waveAmplitude: float,
+    waveLength: float,
+    brightnessModulation: str,
 ) -> dict[str, Any]:
     return {
         "bedX": bedX,
@@ -1198,6 +1332,16 @@ def _params_from_form(
         "penThickness": penThickness,
         "densityFudge": densityFudge,
         "brightnessCutoff": brightnessCutoff,
+        "patternLayout": patternLayout,
+        "waveform": waveform,
+        "patternCenterX": patternCenterX,
+        "patternCenterY": patternCenterY,
+        "patternAngle": patternAngle,
+        "patternSpacing": patternSpacing,
+        "patternClockwise": patternClockwise,
+        "waveAmplitude": waveAmplitude,
+        "waveLength": waveLength,
+        "brightnessModulation": brightnessModulation,
     }
 
 
@@ -1263,6 +1407,16 @@ async def create_generation_job(
     penThickness: float = Form(0.5),
     densityFudge: float = Form(0.0),
     brightnessCutoff: float = Form(DEFAULT_BRIGHTNESS_CUTOFF),
+    patternLayout: str = Form("linear"),
+    waveform: str = Form("zigzag"),
+    patternCenterX: float = Form(105.0),
+    patternCenterY: float = Form(148.5),
+    patternAngle: float = Form(0.0),
+    patternSpacing: float = Form(1.0),
+    patternClockwise: bool = Form(True),
+    waveAmplitude: float = Form(0.5),
+    waveLength: float = Form(3.0),
+    brightnessModulation: str = Form("both"),
 ):
     _cleanup_jobs()
     if _active_job_count() >= MAX_PENDING_JOBS:
@@ -1286,6 +1440,16 @@ async def create_generation_job(
         penThickness,
         densityFudge,
         brightnessCutoff,
+        patternLayout,
+        waveform,
+        patternCenterX,
+        patternCenterY,
+        patternAngle,
+        patternSpacing,
+        patternClockwise,
+        waveAmplitude,
+        waveLength,
+        brightnessModulation,
     )
     try:
         validate_generation_params(params)
@@ -1433,6 +1597,16 @@ async def generate_gcode_compatibility(
     penThickness: float = Form(0.5),
     densityFudge: float = Form(0.0),
     brightnessCutoff: float = Form(DEFAULT_BRIGHTNESS_CUTOFF),
+    patternLayout: str = Form("linear"),
+    waveform: str = Form("zigzag"),
+    patternCenterX: float = Form(105.0),
+    patternCenterY: float = Form(148.5),
+    patternAngle: float = Form(0.0),
+    patternSpacing: float = Form(1.0),
+    patternClockwise: bool = Form(True),
+    waveAmplitude: float = Form(0.5),
+    waveLength: float = Form(3.0),
+    brightnessModulation: str = Form("both"),
 ):
     """Backward-compatible synchronous endpoint for existing API clients."""
     svg_content = await _read_svg(file)
@@ -1453,6 +1627,16 @@ async def generate_gcode_compatibility(
         penThickness,
         densityFudge,
         brightnessCutoff,
+        patternLayout,
+        waveform,
+        patternCenterX,
+        patternCenterY,
+        patternAngle,
+        patternSpacing,
+        patternClockwise,
+        waveAmplitude,
+        waveLength,
+        brightnessModulation,
     )
     try:
         validate_generation_params(params)

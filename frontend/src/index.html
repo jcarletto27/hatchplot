@@ -487,7 +487,79 @@
                     <label for="brightnessCutoff">Brightness cutoff (0 to 1)</label>
                     <input type="number" id="brightnessCutoff" name="brightnessCutoff" min="0" max="1" step="0.01" value="0.025">
                 </div>
-                <div class="helper-card">Pen size sets the minimum useful step-over. Positive fudge produces a denser, darker zig-zag; negative values produce a lighter result. Brightness cutoff skips white or nearly white areas.</div>
+                <div class="helper-card">Pen size sets the minimum useful step-over. Positive fudge produces a denser, darker result. Brightness cutoff skips white or nearly white areas.</div>
+
+                <div class="subsection-title">Pattern</div>
+                <div class="flex-row">
+                    <div class="form-group">
+                        <label for="patternLayout">Layout</label>
+                        <select id="patternLayout" name="patternLayout">
+                            <option value="linear">Linear</option>
+                            <option value="spiral">Spiral</option>
+                            <option value="concentric">Concentric</option>
+                            <option value="radial">Radial</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="waveform">Line waveform</label>
+                        <select id="waveform" name="waveform">
+                            <option value="zigzag">Zig-zag</option>
+                            <option value="sawtooth">Sawtooth</option>
+                            <option value="sine">Sine</option>
+                            <option value="ekg">EKG</option>
+                            <option value="straight">Straight</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="flex-row">
+                    <div class="form-group">
+                        <label for="patternSpacing">Layout spacing (mm)</label>
+                        <input type="number" id="patternSpacing" min="0.05" max="500" step="0.05" value="1">
+                    </div>
+                    <div class="form-group" id="patternAngleGroup">
+                        <label for="patternAngle">Layout angle (°)</label>
+                        <input type="number" id="patternAngle" step="1" value="0">
+                    </div>
+                </div>
+                <div class="flex-row">
+                    <div class="form-group">
+                        <label for="patternCenterX">Pattern center X (mm)</label>
+                        <input type="number" id="patternCenterX" step="0.1" value="105">
+                    </div>
+                    <div class="form-group">
+                        <label for="patternCenterY">Pattern center Y (mm)</label>
+                        <input type="number" id="patternCenterY" step="0.1" value="148.5">
+                    </div>
+                </div>
+                <div class="flex-row">
+                    <div class="form-group"><button type="button" id="centerPatternBtn" class="secondary-btn">Use Workspace Center</button></div>
+                    <div class="form-group"><button type="button" id="pickPatternCenterBtn" class="secondary-btn">Pick Center on Canvas</button></div>
+                </div>
+                <div class="checkbox-row" id="patternDirectionGroup">
+                    <input type="checkbox" id="patternClockwise" checked>
+                    <label for="patternClockwise">Clockwise spiral, rings, or spokes</label>
+                </div>
+
+                <div class="subsection-title">Waveform</div>
+                <div class="flex-row" id="waveformControls">
+                    <div class="form-group">
+                        <label for="waveAmplitude">Maximum amplitude (mm)</label>
+                        <input type="number" id="waveAmplitude" min="0" max="500" step="0.05" value="0.5">
+                    </div>
+                    <div class="form-group">
+                        <label for="waveLength">Base wavelength (mm)</label>
+                        <input type="number" id="waveLength" min="0.05" max="5000" step="0.1" value="3">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="brightnessModulation">Brightness changes</label>
+                    <select id="brightnessModulation">
+                        <option value="both">Amplitude and frequency</option>
+                        <option value="amplitude">Amplitude only</option>
+                        <option value="frequency">Frequency only</option>
+                        <option value="none">Cutoff only</option>
+                    </select>
+                </div>
                 <div class="checkbox-row">
                     <input type="checkbox" id="autoPreviewGeneration" checked>
                     <label for="autoPreviewGeneration">Auto-display and simulate toolpath chunks while generating</label>

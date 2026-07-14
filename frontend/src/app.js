@@ -28,6 +28,8 @@ let livePreviewCursor = 0;
 let livePreviewInitialized = false;
 let workspaceFitZoom = 1;
 let canvasZoomPercent = 100;
+let patternCenterMarker = null;
+let pickingPatternCenter = false;
 
 const MACHINE_SETTINGS_KEY = 'hatchPlotter.machineSettings.v1';
 const UI_SETTINGS_KEY = 'hatchPlotter.uiSettings.v1';
@@ -46,7 +48,16 @@ const MACHINE_SETTING_IDS = [
     'zPlungeRate',
     'penThickness',
     'densityFudge',
-    'brightnessCutoff'
+    'brightnessCutoff',
+    'patternLayout',
+    'waveform',
+    'patternCenterX',
+    'patternCenterY',
+    'patternAngle',
+    'patternSpacing',
+    'waveAmplitude',
+    'waveLength',
+    'brightnessModulation'
 ];
 
 function readPositiveNumber(id, fallback) {
@@ -422,6 +433,43 @@ function setCenterInputs() {
 function centerSvgInWorkspace(apply = true) {
     setCenterInputs();
     if (apply) applyTransforms();
+}
+
+
+function updatePatternCenterMarker() {
+    const x = Number.parseFloat(document.getElementById('patternCenterX').value);
+    const y = Number.parseFloat(document.getElementById('patternCenterY').value);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    if (patternCenterMarker) patternCenterMarker.remove();
+    patternCenterMarker = new paper.Group({ name: 'patternCenterMarker' });
+    const radius = Math.max(2.5, readPositiveNumber('penThickness', 0.5) * 2);
+    patternCenterMarker.addChild(new paper.Path.Circle({
+        center: [x, y], radius, strokeColor: '#f6c85f', strokeWidth: 1.2
+    }));
+    patternCenterMarker.addChild(new paper.Path.Line({
+        from: [x - radius * 1.5, y], to: [x + radius * 1.5, y], strokeColor: '#f6c85f', strokeWidth: 1
+    }));
+    patternCenterMarker.addChild(new paper.Path.Line({
+        from: [x, y - radius * 1.5], to: [x, y + radius * 1.5], strokeColor: '#f6c85f', strokeWidth: 1
+    }));
+    patternCenterMarker.bringToFront();
+}
+
+function setPatternCenterToWorkspace() {
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    document.getElementById('patternCenterX').value = formatNumber(bedX / 2, 3);
+    document.getElementById('patternCenterY').value = formatNumber(bedY / 2, 3);
+    saveMachineSettings();
+    updatePatternCenterMarker();
+}
+
+function updatePatternControlVisibility() {
+    const layout = document.getElementById('patternLayout').value;
+    const waveform = document.getElementById('waveform').value;
+    document.getElementById('patternAngleGroup').style.display = ['linear', 'radial'].includes(layout) ? '' : 'none';
+    document.getElementById('patternDirectionGroup').style.display = ['spiral', 'concentric', 'radial'].includes(layout) ? 'flex' : 'none';
+    document.getElementById('waveformControls').style.display = waveform === 'straight' ? 'none' : 'flex';
 }
 
 // --- WORKSPACE INITIALIZATION ---
@@ -997,6 +1045,12 @@ async function buildGenerationFormData(penThickness) {
     if (!Number.isFinite(brightnessCutoff) || brightnessCutoff < 0 || brightnessCutoff > 1) {
         throw new Error('Brightness cutoff must be between 0 and 1.');
     }
+    const patternSpacing = Number.parseFloat(document.getElementById('patternSpacing').value);
+    const waveAmplitude = Number.parseFloat(document.getElementById('waveAmplitude').value);
+    const waveLength = Number.parseFloat(document.getElementById('waveLength').value);
+    if (!Number.isFinite(patternSpacing) || patternSpacing < 0.05) throw new Error('Layout spacing must be at least 0.05 mm.');
+    if (!Number.isFinite(waveAmplitude) || waveAmplitude < 0) throw new Error('Wave amplitude cannot be negative.');
+    if (!Number.isFinite(waveLength) || waveLength < 0.05) throw new Error('Wavelength must be at least 0.05 mm.');
 
     const brightnessMap = await renderBrightnessMap(penThickness);
     const formData = new FormData();
@@ -1018,6 +1072,16 @@ async function buildGenerationFormData(penThickness) {
     formData.append('penThickness', formatNumber(penThickness, 4));
     formData.append('densityFudge', formatNumber(densityFudge, 3));
     formData.append('brightnessCutoff', formatNumber(brightnessCutoff, 3));
+    formData.append('patternLayout', document.getElementById('patternLayout').value);
+    formData.append('waveform', document.getElementById('waveform').value);
+    formData.append('patternCenterX', document.getElementById('patternCenterX').value);
+    formData.append('patternCenterY', document.getElementById('patternCenterY').value);
+    formData.append('patternAngle', document.getElementById('patternAngle').value);
+    formData.append('patternSpacing', formatNumber(patternSpacing, 4));
+    formData.append('patternClockwise', document.getElementById('patternClockwise').checked ? 'true' : 'false');
+    formData.append('waveAmplitude', formatNumber(waveAmplitude, 4));
+    formData.append('waveLength', formatNumber(waveLength, 4));
+    formData.append('brightnessModulation', document.getElementById('brightnessModulation').value);
     formData.append('enabledLayers', JSON.stringify(enabledLayerNames));
     return formData;
 }
@@ -1121,6 +1185,9 @@ function displayGeneratedResult(data) {
         stats.pen_thickness_mm ? `${formatNumber(Number(stats.pen_thickness_mm), 3)} mm pen` : null,
         stats.density_fudge !== undefined ? `${Number(stats.density_fudge) >= 0 ? '+' : ''}${formatNumber(Number(stats.density_fudge), 2)} density fudge` : null,
         stats.brightness_cutoff !== undefined ? `${formatNumber(Number(stats.brightness_cutoff), 3)} brightness cutoff` : null,
+        stats.pattern_layout ? `${stats.pattern_layout} layout` : null,
+        stats.waveform ? `${stats.waveform} waveform` : null,
+        stats.pattern_spacing_mm ? `${formatNumber(Number(stats.pattern_spacing_mm), 3)} mm layout spacing` : null,
         stats.gcode_lines ? `${Number(stats.gcode_lines).toLocaleString()} G-code lines` : null,
         stats.row_pitch_mm ? `${formatNumber(Number(stats.row_pitch_mm), 3)} mm row pitch` : null,
         stats.sample_step_mm ? `${formatNumber(Number(stats.sample_step_mm), 3)} mm sample step` : null,
