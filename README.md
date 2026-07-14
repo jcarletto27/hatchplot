@@ -1,4 +1,4 @@
-# Hatch Plotter
+# HatchPlot
 
 Dockerized SVG-to-hatched-G-code generator with a Paper.js preview, FastAPI backend, and Nginx reverse proxy.
 

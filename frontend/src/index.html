@@ -483,7 +483,11 @@
                         <input type="number" id="densityFudge" name="densityFudge" min="-0.5" max="0.5" step="0.05" value="0">
                     </div>
                 </div>
-                <div class="helper-card">Pen size sets the minimum useful step-over. Positive fudge produces a denser, darker zig-zag; negative values produce a lighter result.</div>
+                <div class="form-group">
+                    <label for="brightnessCutoff">Brightness cutoff (0 to 1)</label>
+                    <input type="number" id="brightnessCutoff" name="brightnessCutoff" min="0" max="1" step="0.01" value="0.025">
+                </div>
+                <div class="helper-card">Pen size sets the minimum useful step-over. Positive fudge produces a denser, darker zig-zag; negative values produce a lighter result. Brightness cutoff skips white or nearly white areas.</div>
                 <div class="checkbox-row">
                     <input type="checkbox" id="autoPreviewGeneration" checked>
                     <label for="autoPreviewGeneration">Auto-display and simulate toolpath chunks while generating</label>

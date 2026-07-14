@@ -45,7 +45,8 @@ const MACHINE_SETTING_IDS = [
     'xyFeedRate',
     'zPlungeRate',
     'penThickness',
-    'densityFudge'
+    'densityFudge',
+    'brightnessCutoff'
 ];
 
 function readPositiveNumber(id, fallback) {
@@ -992,6 +993,10 @@ async function buildGenerationFormData(penThickness) {
     if (!Number.isFinite(densityFudge) || densityFudge < -0.5 || densityFudge > 0.5) {
         throw new Error('Density fudge must be between -0.5 and 0.5.');
     }
+    const brightnessCutoff = Number.parseFloat(document.getElementById('brightnessCutoff').value);
+    if (!Number.isFinite(brightnessCutoff) || brightnessCutoff < 0 || brightnessCutoff > 1) {
+        throw new Error('Brightness cutoff must be between 0 and 1.');
+    }
 
     const brightnessMap = await renderBrightnessMap(penThickness);
     const formData = new FormData();
@@ -1012,6 +1017,7 @@ async function buildGenerationFormData(penThickness) {
     formData.append('zPlungeRate', document.getElementById('zPlungeRate').value);
     formData.append('penThickness', formatNumber(penThickness, 4));
     formData.append('densityFudge', formatNumber(densityFudge, 3));
+    formData.append('brightnessCutoff', formatNumber(brightnessCutoff, 3));
     formData.append('enabledLayers', JSON.stringify(enabledLayerNames));
     return formData;
 }
@@ -1114,6 +1120,7 @@ function displayGeneratedResult(data) {
         stats.scanlines ? `${Number(stats.scanlines).toLocaleString()} brightness scanlines` : null,
         stats.pen_thickness_mm ? `${formatNumber(Number(stats.pen_thickness_mm), 3)} mm pen` : null,
         stats.density_fudge !== undefined ? `${Number(stats.density_fudge) >= 0 ? '+' : ''}${formatNumber(Number(stats.density_fudge), 2)} density fudge` : null,
+        stats.brightness_cutoff !== undefined ? `${formatNumber(Number(stats.brightness_cutoff), 3)} brightness cutoff` : null,
         stats.gcode_lines ? `${Number(stats.gcode_lines).toLocaleString()} G-code lines` : null,
         stats.row_pitch_mm ? `${formatNumber(Number(stats.row_pitch_mm), 3)} mm row pitch` : null,
         stats.sample_step_mm ? `${formatNumber(Number(stats.sample_step_mm), 3)} mm sample step` : null,

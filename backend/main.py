@@ -47,7 +47,7 @@ MAX_HATCH_PATHS = int(os.getenv("MAX_HATCH_PATHS", "50000"))
 MAX_TOOLPATH_POINTS = int(os.getenv("MAX_TOOLPATH_POINTS", "500000"))
 MAX_LIVE_PREVIEW_POINTS = int(os.getenv("MAX_LIVE_PREVIEW_POINTS", "20000"))
 LIVE_PREVIEW_CHUNK_POINTS = int(os.getenv("LIVE_PREVIEW_CHUNK_POINTS", "1600"))
-MIN_DRAW_DARKNESS = float(os.getenv("MIN_DRAW_DARKNESS", "0.025"))
+DEFAULT_BRIGHTNESS_CUTOFF = float(os.getenv("DEFAULT_BRIGHTNESS_CUTOFF", "0.025"))
 MAX_RETAINED_RESULTS = max(1, int(os.getenv("MAX_RETAINED_RESULTS", "4")))
 MAX_PENDING_JOBS = int(os.getenv("MAX_PENDING_JOBS", "4"))
 JOB_WORKERS = max(1, int(os.getenv("JOB_WORKERS", "1")))
@@ -269,6 +269,10 @@ def validate_generation_params(params: dict[str, Any]) -> None:
     if not math.isfinite(density_fudge) or not -0.5 <= density_fudge <= 0.5:
         raise GenerationError("densityFudge must be between -0.5 and 0.5.")
 
+    brightness_cutoff = float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF))
+    if not math.isfinite(brightness_cutoff) or not 0.0 <= brightness_cutoff <= 1.0:
+        raise GenerationError("brightnessCutoff must be between 0.0 and 1.0.")
+
     for key in ("svgRotate", "svgPosX", "svgPosY"):
         if not math.isfinite(float(params[key])):
             raise GenerationError(f"{key} must be a finite number.")
@@ -449,6 +453,7 @@ def _connector_is_drawable(
     start: tuple[float, float],
     end: tuple[float, float],
     pen_thickness: float,
+    brightness_cutoff: float,
 ) -> bool:
     distance = math.dist(start, end)
     if distance > pen_thickness * 3.5:
@@ -462,9 +467,9 @@ def _connector_is_drawable(
         y = start[1] + ((end[1] - start[1]) * ratio)
         darkness = _sample_darkness(pixels, width, height, bed_x, bed_y, x, y)
         total_darkness += darkness
-        if darkness >= MIN_DRAW_DARKNESS:
+        if darkness >= brightness_cutoff:
             visible += 1
-    return visible / (samples + 1) >= 0.7 and total_darkness / (samples + 1) >= MIN_DRAW_DARKNESS
+    return visible / (samples + 1) >= 0.7 and total_darkness / (samples + 1) >= brightness_cutoff
 
 
 def _decimate_preview_path(path: list[list[float]], maximum_points: int = 240) -> list[list[float]]:
@@ -535,6 +540,7 @@ def _generate_brightness_paths(
     bed_y = float(params["bedY"])
     pen_thickness = float(params.get("penThickness", 0.5))
     density_fudge = float(params.get("densityFudge", 0.0))
+    brightness_cutoff = float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF))
     density_scale = 1.0 - (density_fudge * 0.8)
 
     _set_progress(
@@ -634,7 +640,7 @@ def _generate_brightness_paths(
         for x, darkness_value in zip(row_x_values, row_darkness_values, strict=True):
             darkness = max(0.0, min(1.0, float(darkness_value) * (1.0 + density_fudge)))
             sampled_points += 1
-            if darkness < MIN_DRAW_DARKNESS:
+            if darkness < brightness_cutoff:
                 if len(current_run) >= 2:
                     runs.append(current_run)
                 current_run = []
@@ -687,6 +693,7 @@ def _generate_brightness_paths(
                                 (chain_end[0], chain_end[1]),
                                 (run_start[0], run_start[1]),
                                 pen_thickness,
+                                brightness_cutoff,
                             ):
                                 best_match = (distance, chain_index, reverse_run)
 
@@ -738,7 +745,7 @@ def _generate_brightness_paths(
     if not completed_paths:
         raise GenerationError(
             "The transformed SVG contains no pixels dark enough to draw. "
-            "Check its placement, opacity, and colors, or lower MIN_DRAW_DARKNESS."
+            "Check its placement, opacity, and colors, or lower the brightness cutoff."
         )
     _set_progress(
         progress,
@@ -760,6 +767,7 @@ def _generate_brightness_paths(
         "compute_backend": compute_backend,
         "gpu_accelerated": compute_backend == "cuda",
         "density_fudge": density_fudge,
+        "brightness_cutoff": brightness_cutoff,
         "live_preview_points": preview_state["points"],
     }
 
@@ -1002,6 +1010,7 @@ def generate_toolpath(
             "compute_backend": "geos-cpu",
             "gpu_accelerated": False,
             "density_fudge": float(params.get("densityFudge", 0.0)),
+            "brightness_cutoff": float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF)),
             "live_preview_points": preview_state["points"],
         },
     }
@@ -1171,6 +1180,7 @@ def _params_from_form(
     zPlungeRate: int,
     penThickness: float,
     densityFudge: float,
+    brightnessCutoff: float,
 ) -> dict[str, Any]:
     return {
         "bedX": bedX,
@@ -1187,6 +1197,7 @@ def _params_from_form(
         "zPlungeRate": zPlungeRate,
         "penThickness": penThickness,
         "densityFudge": densityFudge,
+        "brightnessCutoff": brightnessCutoff,
     }
 
 
@@ -1251,6 +1262,7 @@ async def create_generation_job(
     zPlungeRate: int = Form(300),
     penThickness: float = Form(0.5),
     densityFudge: float = Form(0.0),
+    brightnessCutoff: float = Form(DEFAULT_BRIGHTNESS_CUTOFF),
 ):
     _cleanup_jobs()
     if _active_job_count() >= MAX_PENDING_JOBS:
@@ -1273,6 +1285,7 @@ async def create_generation_job(
         zPlungeRate,
         penThickness,
         densityFudge,
+        brightnessCutoff,
     )
     try:
         validate_generation_params(params)
@@ -1419,6 +1432,7 @@ async def generate_gcode_compatibility(
     zPlungeRate: int = Form(300),
     penThickness: float = Form(0.5),
     densityFudge: float = Form(0.0),
+    brightnessCutoff: float = Form(DEFAULT_BRIGHTNESS_CUTOFF),
 ):
     """Backward-compatible synchronous endpoint for existing API clients."""
     svg_content = await _read_svg(file)
@@ -1438,6 +1452,7 @@ async def generate_gcode_compatibility(
         zPlungeRate,
         penThickness,
         densityFudge,
+        brightnessCutoff,
     )
     try:
         validate_generation_params(params)
