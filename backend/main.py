@@ -575,6 +575,55 @@ def _waveform_value(waveform: str, phase: float) -> float:
     return _triangle_wave(wrapped)
 
 
+_DENSITY_BAYER_8 = (
+    (0, 48, 12, 60, 3, 51, 15, 63),
+    (32, 16, 44, 28, 35, 19, 47, 31),
+    (8, 56, 4, 52, 11, 59, 7, 55),
+    (40, 24, 36, 20, 43, 27, 39, 23),
+    (2, 50, 14, 62, 1, 49, 13, 61),
+    (34, 18, 46, 30, 33, 17, 45, 29),
+    (10, 58, 6, 54, 9, 57, 5, 53),
+    (42, 26, 38, 22, 41, 25, 37, 21),
+)
+
+
+def _ordered_density_threshold(lane_index: int) -> float:
+    """Return a stable 64-level threshold for adjacent hatch carriers.
+
+    Ordered thresholds convert normalized image darkness into actual local line
+    density. Black pixels retain every nearby carrier, mid-gray pixels retain a
+    proportional subset, and white pixels retain none.
+    """
+    index = max(0, int(lane_index)) % 64
+    row, column = divmod(index, 8)
+    return (_DENSITY_BAYER_8[row][column] + 0.5) / 64.0
+
+
+def _density_lane_index(
+    layout: str,
+    carrier_index: int,
+    point: tuple[float, float],
+    center_x: float,
+    center_y: float,
+    spacing: float,
+) -> int:
+    # A spiral is represented by one carrier, so use its current turn as the
+    # density lane. Other layouts already have one carrier per row/ring/spoke.
+    if layout == "spiral":
+        radius = math.hypot(point[0] - center_x, point[1] - center_y)
+        return int(math.floor(radius / max(spacing, 1e-9)))
+    return carrier_index
+
+
+def _passes_density_gate(darkness: float, cutoff: float, lane_index: int) -> bool:
+    if darkness < cutoff:
+        return False
+    if cutoff >= 1.0:
+        return darkness >= 1.0
+    normalized = max(0.0, min(1.0, (darkness - cutoff) / (1.0 - cutoff)))
+    return normalized >= _ordered_density_threshold(lane_index)
+
+
 def _sample_segment(start: tuple[float, float], end: tuple[float, float], step: float) -> list[tuple[float, float]]:
     distance = math.dist(start, end)
     count = max(1, int(math.ceil(distance / max(step, 0.01))))
@@ -771,6 +820,7 @@ def _generate_brightness_paths(
         raise GenerationLimitError(f"The brightness map contains more than {MAX_BRIGHTNESS_MAP_PIXELS:,} pixels.")
 
     rgba = image.convert("RGBA")
+    pixels = rgba.load()
     pixel_mm = max(bed_x / max(1, rgba.width - 1), bed_y / max(1, rgba.height - 1))
     sample_step = max(pen_thickness * 0.5, pixel_mm, 0.05)
     carriers = _build_pattern_carriers(
@@ -808,8 +858,11 @@ def _generate_brightness_paths(
 
         for point_index, (point, raw_darkness) in enumerate(zip(carrier, darkness_values, strict=True)):
             darkness = max(0.0, min(1.0, float(raw_darkness) * (1.0 + density_fudge)))
+            lane_index = _density_lane_index(
+                layout, carrier_index, point, center_x, center_y, layout_spacing
+            )
             sampled_points += 1
-            if darkness < brightness_cutoff:
+            if not _passes_density_gate(darkness, brightness_cutoff, lane_index):
                 if len(current_run) >= 2:
                     completed_paths.append(current_run)
                     preview_pending.append(current_run)
@@ -842,7 +895,27 @@ def _generate_brightness_paths(
                     completed_paths.append(current_run)
                     preview_pending.append(current_run)
                 current_run = []
+                previous_point = None
                 continue
+
+            # Re-sample at the actual displaced output coordinate. This keeps
+            # high-amplitude zig-zag, sawtooth, sine, and EKG points from
+            # wandering into white or transparent regions near artwork edges.
+            output_darkness = _sample_darkness(
+                pixels, rgba.width, rgba.height, bed_x, bed_y, x, y
+            )
+            output_darkness = max(
+                0.0, min(1.0, output_darkness * (1.0 + density_fudge))
+            )
+            if not _passes_density_gate(output_darkness, brightness_cutoff, lane_index):
+                if len(current_run) >= 2:
+                    completed_paths.append(current_run)
+                    preview_pending.append(current_run)
+                current_run = []
+                previous_point = None
+                phase = 0.0
+                continue
+
             current_run.append([round(x, 4), round(y, 4)])
 
         if len(current_run) >= 2:
@@ -893,6 +966,7 @@ def _generate_brightness_paths(
         "wave_amplitude_mm": wave_amplitude,
         "wave_length_mm": wave_length,
         "brightness_modulation": brightness_mode,
+        "density_mapping": "ordered-64-level",
         "live_preview_points": preview_state["points"],
     }
 
