@@ -263,8 +263,29 @@
             padding: 0 2px 10px;
         }
         .canvas-toolbar button { width: auto; min-width: 42px; min-height: 34px; margin: 0; padding: 6px 10px; }
+        .secondary-btn.is-active {
+            color: #171000;
+            background: #f6c85f;
+            border-color: #f6c85f;
+            box-shadow: 0 0 0 3px rgba(246, 200, 95, 0.18);
+        }
         .canvas-toolbar input[type="range"] { width: min(260px, 36vw); }
         .toolbar-spacer { flex: 1; }
+        .toolbar-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            margin: 0;
+            padding: 7px 10px;
+            color: #d7e1ee;
+            background: rgba(8, 13, 21, 0.48);
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            font-size: 0.74rem;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+        .toolbar-toggle input { width: auto; min-height: 0; margin: 0; accent-color: var(--accent); }
         #zoomLabel { min-width: 54px; color: var(--muted); font-size: 0.76rem; text-align: right; }
         .canvas-shell {
             min-height: 0;
@@ -282,6 +303,31 @@
             box-shadow: inset 0 0 0 1px rgba(9, 16, 25, 0.20);
         }
         canvas { display: block; width: 100%; height: 100%; background: transparent; }
+        canvas.picking-pattern-center { cursor: crosshair; }
+        .cutoff-preview-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .cutoff-preview-status {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            color: var(--muted);
+            font-size: 0.72rem;
+            line-height: 1.35;
+        }
+        .cutoff-preview-status::before {
+            content: "";
+            width: 10px;
+            height: 10px;
+            flex: 0 0 10px;
+            border-radius: 3px;
+            background: rgba(255, 42, 42, 0.72);
+            box-shadow: 0 0 0 1px rgba(255, 120, 120, 0.5);
+        }
 
         .output-panel {
             flex: 0 0 auto;
@@ -305,6 +351,12 @@
         .output-panel summary .chevron { margin-left: auto; }
         .output-panel[open] summary .chevron { transform: rotate(180deg); }
         .line-count { color: var(--muted); font-weight: 600; }
+        .output-actions {
+            display: flex;
+            justify-content: flex-end;
+            padding: 10px 12px 0;
+        }
+        .output-actions button { width: auto; min-height: 34px; margin: 0; padding: 6px 12px; }
         textarea {
             display: block;
             width: calc(100% - 20px);
@@ -487,6 +539,13 @@
                     <label for="brightnessCutoff">Brightness cutoff (0 to 1)</label>
                     <input type="number" id="brightnessCutoff" name="brightnessCutoff" min="0" max="1" step="0.01" value="0.025">
                 </div>
+                <div class="cutoff-preview-row">
+                    <div class="checkbox-row">
+                        <input type="checkbox" id="showBrightnessCutoffPreview">
+                        <label for="showBrightnessCutoffPreview">Preview cutoff exclusions on canvas</label>
+                    </div>
+                    <div id="brightnessCutoffPreviewStatus" class="cutoff-preview-status">Enable the preview to highlight excluded SVG pixels in red.</div>
+                </div>
                 <div class="helper-card">Brightness always controls local line density: darker areas retain more carriers, lighter areas retain fewer, and white areas are skipped. Pen size sets the minimum useful step-over. Positive fudge produces a denser, darker result.</div>
 
                 <div class="subsection-title">Pattern</div>
@@ -533,7 +592,7 @@
                 </div>
                 <div class="flex-row">
                     <div class="form-group"><button type="button" id="centerPatternBtn" class="secondary-btn">Use Workspace Center</button></div>
-                    <div class="form-group"><button type="button" id="pickPatternCenterBtn" class="secondary-btn">Pick Center on Canvas</button></div>
+                    <div class="form-group"><button type="button" id="pickPatternCenterBtn" class="secondary-btn" aria-pressed="false">Pick Center on Canvas</button></div>
                 </div>
                 <div class="checkbox-row" id="patternDirectionGroup">
                     <input type="checkbox" id="patternClockwise" checked>
@@ -564,10 +623,6 @@
                     <input type="checkbox" id="autoPreviewGeneration" checked>
                     <label for="autoPreviewGeneration">Auto-display and simulate toolpath chunks while generating</label>
                 </div>
-                <div class="checkbox-row">
-                    <input type="checkbox" id="hideSvgDuringSimulation">
-                    <label for="hideSvgDuringSimulation">Hide the source SVG during simulation</label>
-                </div>
                 <div class="flex-row">
                     <div class="form-group"><button id="generateBtn">Generate Toolpath</button></div>
                     <div class="form-group"><button type="button" id="cancelGenerateBtn" class="danger-btn" disabled>Cancel</button></div>
@@ -575,7 +630,7 @@
                 <div class="flex-row" style="align-items: flex-end;">
                     <div class="form-group">
                         <label for="simSpeed">Simulation speed</label>
-                        <input type="range" id="simSpeed" min="1" max="100" value="20">
+                        <input type="range" id="simSpeed" min="1" max="300" value="20">
                     </div>
                     <div class="form-group"><button type="button" id="simBtn" class="sim-btn">Play Simulation</button></div>
                     <div class="form-group"><button type="button" id="stopSimBtn" class="danger-btn" disabled>Stop Simulation</button></div>
@@ -611,6 +666,10 @@
                 <input type="range" id="zoomSlider" min="25" max="800" step="5" value="100" aria-label="Canvas zoom percentage">
                 <span id="zoomLabel">100%</span>
                 <span class="toolbar-spacer"></span>
+                <label class="toolbar-toggle" for="hideSourceSvg">
+                    <input type="checkbox" id="hideSourceSvg">
+                    Hide Source SVG
+                </label>
             </div>
             <div class="canvas-shell">
                 <canvas id="canvas" resize></canvas>
@@ -623,6 +682,9 @@
                 <span id="gcodeLineCount" class="line-count">0 lines</span>
                 <span class="chevron">⌄</span>
             </summary>
+            <div class="output-actions">
+                <button type="button" id="exportGcodeBtn" class="secondary-btn" disabled>Export G-code</button>
+            </div>
             <textarea id="gcodeOutput" readonly spellcheck="false" placeholder="Generated G-code appears here. The currently executing line is highlighted during simulation."></textarea>
         </details>
     </main>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import math
 import os
@@ -970,6 +971,40 @@ def _generate_brightness_paths(
         "live_preview_points": preview_state["points"],
     }
 
+def _gcode_comment_value(value: Any) -> str:
+    text = str(value if value is not None else "")
+    return " ".join(text.replace("\r", " ").replace("\n", " ").split())
+
+
+def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
+    layers = params.get("enabledLayers") or []
+    if isinstance(layers, str):
+        layers_text = layers
+    else:
+        layers_text = ", ".join(_gcode_comment_value(layer) for layer in layers) or "All visible layers"
+
+    direction = "clockwise" if bool(params.get("patternClockwise", True)) else "counterclockwise"
+    lines = [
+        "; HatchPlot generated G-code",
+        f"; Source SVG: {_gcode_comment_value(params.get('sourceFilename', 'uploaded.svg'))}",
+        f"; Enabled layers: {_gcode_comment_value(layers_text)}",
+        f"; Machine bed: {float(params['bedX']):.3f} x {float(params['bedY']):.3f} mm",
+        f"; Z control: {_gcode_comment_value(params['zMode'])}; up={_gcode_comment_value(params['zUp'])}; down={_gcode_comment_value(params['zDown'])}; plunge={int(params['zPlungeRate'])} mm/min",
+        f"; XY feed rate: {int(params['xyFeedRate'])} mm/min",
+        f"; Pen size: {float(params.get('penThickness', 0.5)):.3f} mm",
+        f"; SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({float(params['svgPosX']):.3f}, {float(params['svgPosY']):.3f}) mm",
+        f"; Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
+        f"; Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={float(params.get('patternSpacing', 1.0)):.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({float(params.get('patternCenterX', 0.0)):.3f}, {float(params.get('patternCenterY', 0.0)):.3f}) mm; direction={direction}",
+        f"; Waveform: type={_gcode_comment_value(params.get('waveform', 'zigzag'))}; amplitude={float(params.get('waveAmplitude', 0.5)):.3f} mm; wavelength={float(params.get('waveLength', 3.0)):.3f} mm",
+        f"; Toolpaths: {path_count}",
+        "; End HatchPlot header",
+        "G21",
+        "G90",
+        f"G0 Z{params['zUp']}" if params["zMode"] == "stepper" else f"M3 S{params['zUp']}",
+    ]
+    return lines
+
+
 def _compile_gcode(paths: list[list[list[float]]], params: dict[str, Any]) -> list[str]:
     z_mode = str(params["zMode"])
     z_up = str(params["zUp"])
@@ -977,7 +1012,7 @@ def _compile_gcode(paths: list[list[list[float]]], params: dict[str, Any]) -> li
     xy_feed_rate = int(params["xyFeedRate"])
     z_plunge_rate = int(params["zPlungeRate"])
 
-    gcode = ["G21", "G90", f"G0 Z{z_up}" if z_mode == "stepper" else f"M3 S{z_up}"]
+    gcode = _gcode_preamble(params, len(paths))
     for path in paths:
         first = path[0]
         gcode.append(f"G0 X{first[0]:.2f} Y{first[1]:.2f}")
@@ -1026,6 +1061,7 @@ def generate_toolpath(
                 "continuous_paths": len(compiled_paths),
                 "toolpath_points": toolpath_points,
                 "gcode_lines": len(gcode),
+                "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
                 "pen_thickness_mm": float(params.get("penThickness", 0.5)),
                 **raster_stats,
             },
@@ -1201,6 +1237,7 @@ def generate_toolpath(
             "hatch_paths": len(compiled_paths),
             "toolpath_points": toolpath_points,
             "gcode_lines": len(gcode),
+            "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
             "scale_mode": scale_mode,
             "scale_percent": float(params["svgScale"]),
             "source_width": round(svg_width, 4),
@@ -1491,6 +1528,7 @@ async def create_generation_job(
     waveAmplitude: float = Form(0.5),
     waveLength: float = Form(3.0),
     brightnessModulation: str = Form("both"),
+    enabledLayers: str = Form("[]"),
 ):
     _cleanup_jobs()
     if _active_job_count() >= MAX_PENDING_JOBS:
@@ -1525,6 +1563,12 @@ async def create_generation_job(
         waveLength,
         brightnessModulation,
     )
+    params["sourceFilename"] = file.filename or "uploaded.svg"
+    try:
+        parsed_layers = json.loads(enabledLayers)
+        params["enabledLayers"] = [str(layer) for layer in parsed_layers] if isinstance(parsed_layers, list) else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        params["enabledLayers"] = []
     try:
         validate_generation_params(params)
     except GenerationError as exc:
@@ -1681,6 +1725,7 @@ async def generate_gcode_compatibility(
     waveAmplitude: float = Form(0.5),
     waveLength: float = Form(3.0),
     brightnessModulation: str = Form("both"),
+    enabledLayers: str = Form("[]"),
 ):
     """Backward-compatible synchronous endpoint for existing API clients."""
     svg_content = await _read_svg(file)
@@ -1712,6 +1757,12 @@ async def generate_gcode_compatibility(
         waveLength,
         brightnessModulation,
     )
+    params["sourceFilename"] = file.filename or "uploaded.svg"
+    try:
+        parsed_layers = json.loads(enabledLayers)
+        params["enabledLayers"] = [str(layer) for layer in parsed_layers] if isinstance(parsed_layers, list) else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        params["enabledLayers"] = []
     try:
         validate_generation_params(params)
         loop = asyncio.get_running_loop()

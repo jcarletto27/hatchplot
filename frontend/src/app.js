@@ -30,6 +30,9 @@ let workspaceFitZoom = 1;
 let canvasZoomPercent = 100;
 let patternCenterMarker = null;
 let pickingPatternCenter = false;
+let brightnessCutoffOverlay = null;
+let brightnessCutoffPreviewToken = 0;
+let brightnessCutoffPreviewTimer = null;
 
 const MACHINE_SETTINGS_KEY = 'hatchPlotter.machineSettings.v1';
 const UI_SETTINGS_KEY = 'hatchPlotter.uiSettings.v1';
@@ -338,8 +341,14 @@ function restoreStoredSettings() {
         if (typeof uiSettings.autoPreviewGeneration === 'boolean') {
             document.getElementById('autoPreviewGeneration').checked = uiSettings.autoPreviewGeneration;
         }
-        if (typeof uiSettings.hideSvgDuringSimulation === 'boolean') {
-            document.getElementById('hideSvgDuringSimulation').checked = uiSettings.hideSvgDuringSimulation;
+        const hideSourceSvg = typeof uiSettings.hideSourceSvg === 'boolean'
+            ? uiSettings.hideSourceSvg
+            : uiSettings.hideSvgDuringSimulation;
+        if (typeof hideSourceSvg === 'boolean') {
+            document.getElementById('hideSourceSvg').checked = hideSourceSvg;
+        }
+        if (typeof uiSettings.showBrightnessCutoffPreview === 'boolean') {
+            document.getElementById('showBrightnessCutoffPreview').checked = uiSettings.showBrightnessCutoffPreview;
         }
         const sectionStates = uiSettings.sectionStates || {};
         COLLAPSIBLE_SECTION_IDS.forEach(id => {
@@ -380,7 +389,8 @@ function saveUiSettings() {
         localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify({
             autoCenter: document.getElementById('autoCenter').checked,
             autoPreviewGeneration: document.getElementById('autoPreviewGeneration').checked,
-            hideSvgDuringSimulation: document.getElementById('hideSvgDuringSimulation').checked,
+            hideSourceSvg: document.getElementById('hideSourceSvg').checked,
+            showBrightnessCutoffPreview: document.getElementById('showBrightnessCutoffPreview').checked,
             sectionStates
         }));
     } catch (error) {
@@ -388,17 +398,135 @@ function saveUiSettings() {
     }
 }
 
-function simulationContextIsActive() {
-    const liveSimulation = Boolean(activeJobId)
-        && document.getElementById('autoPreviewGeneration').checked
-        && livePreviewInitialized;
-    return isAnimating || (liveSimulation && !simulationStoppedByUser);
-}
-
 function syncSourceSvgVisibility() {
     if (!workingSVG) return;
-    const hideDuringSimulation = document.getElementById('hideSvgDuringSimulation').checked;
-    workingSVG.visible = !(hideDuringSimulation && simulationContextIsActive());
+    workingSVG.visible = !document.getElementById('hideSourceSvg').checked;
+}
+
+function clearBrightnessCutoffPreview(message = 'Enable the preview to highlight excluded SVG pixels in red.') {
+    brightnessCutoffPreviewToken += 1;
+    if (brightnessCutoffOverlay) {
+        brightnessCutoffOverlay.remove();
+        brightnessCutoffOverlay = null;
+    }
+    const status = document.getElementById('brightnessCutoffPreviewStatus');
+    if (status) status.textContent = message;
+}
+
+function scheduleBrightnessCutoffPreview(delay = 120) {
+    window.clearTimeout(brightnessCutoffPreviewTimer);
+    brightnessCutoffPreviewTimer = window.setTimeout(() => {
+        refreshBrightnessCutoffPreview().catch(error => {
+            console.error('Unable to render brightness cutoff preview:', error);
+            clearBrightnessCutoffPreview(`Cutoff preview unavailable: ${error.message}`);
+        });
+    }, Math.max(0, delay));
+}
+
+async function refreshBrightnessCutoffPreview() {
+    const enabled = document.getElementById('showBrightnessCutoffPreview').checked;
+    if (!enabled) {
+        clearBrightnessCutoffPreview();
+        return;
+    }
+    if (!originalSVGImage || !sourceSvgSizeMm) {
+        clearBrightnessCutoffPreview('Load an SVG to preview brightness-cutoff exclusions.');
+        return;
+    }
+
+    const token = ++brightnessCutoffPreviewToken;
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    const maximumDimension = 1400;
+    const pixelsPerMm = Math.max(0.25, Math.min(4, maximumDimension / bedX, maximumDimension / bedY));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.ceil(bedX * pixelsPerMm));
+    canvas.height = Math.max(1, Math.ceil(bedY * pixelsPerMm));
+    const context = canvas.getContext('2d', { alpha: true, willReadFrequently: true });
+    if (!context) throw new Error('The browser could not create the cutoff-preview canvas.');
+
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+
+    const scale = (Number.parseFloat(document.getElementById('svgScale').value) || 100) / 100;
+    const rotation = (Number.parseFloat(document.getElementById('svgRotate').value) || 0) * Math.PI / 180;
+    const posX = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
+    const posY = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+    const sourceWidthPixels = sourceSvgSizeMm.width * pixelsPerMm;
+    const sourceHeightPixels = sourceSvgSizeMm.height * pixelsPerMm;
+
+    context.save();
+    context.translate(posX * pixelsPerMm, posY * pixelsPerMm);
+    context.rotate(rotation);
+    context.scale(scale, scale);
+    context.drawImage(
+        originalSVGImage,
+        -sourceWidthPixels / 2,
+        -sourceHeightPixels / 2,
+        sourceWidthPixels,
+        sourceHeightPixels
+    );
+    context.restore();
+
+    let imageData;
+    try {
+        imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+    } catch (error) {
+        throw new Error('Embed cross-origin SVG images as data URLs before using the cutoff preview.');
+    }
+
+    const cutoff = Math.max(0, Math.min(1, Number.parseFloat(document.getElementById('brightnessCutoff').value) || 0));
+    const densityFudge = Math.max(-0.5, Math.min(0.5, Number.parseFloat(document.getElementById('densityFudge').value) || 0));
+    const data = imageData.data;
+    let sourcePixels = 0;
+    let excludedPixels = 0;
+
+    for (let index = 0; index < data.length; index += 4) {
+        const alpha = data[index + 3] / 255;
+        if (alpha <= 0.01) {
+            data[index + 3] = 0;
+            continue;
+        }
+
+        sourcePixels += 1;
+        const luminance = (
+            (0.2126 * data[index]) +
+            (0.7152 * data[index + 1]) +
+            (0.0722 * data[index + 2])
+        ) / 255;
+        const darkness = Math.max(0, Math.min(1, (1 - luminance) * alpha * (1 + densityFudge)));
+        if (darkness < cutoff) {
+            data[index] = 255;
+            data[index + 1] = 42;
+            data[index + 2] = 42;
+            data[index + 3] = Math.max(80, Math.round(190 * alpha));
+            excludedPixels += 1;
+        } else {
+            data[index + 3] = 0;
+        }
+    }
+
+    context.putImageData(imageData, 0, 0);
+    if (token !== brightnessCutoffPreviewToken || !document.getElementById('showBrightnessCutoffPreview').checked) return;
+
+    if (brightnessCutoffOverlay) brightnessCutoffOverlay.remove();
+    brightnessCutoffOverlay = new paper.Raster(canvas);
+    brightnessCutoffOverlay.name = 'brightnessCutoffOverlay';
+    brightnessCutoffOverlay.size = new paper.Size(bedX, bedY);
+    brightnessCutoffOverlay.position = new paper.Point(bedX / 2, bedY / 2);
+    if (workingSVG) brightnessCutoffOverlay.insertAbove(workingSVG);
+    else if (machineBed) brightnessCutoffOverlay.insertAbove(machineBed);
+
+    allGeneratedPaths.forEach(path => path.bringToFront());
+    if (patternCenterMarker) patternCenterMarker.bringToFront();
+    if (penHead) penHead.bringToFront();
+
+    const excludedPercent = sourcePixels > 0 ? (excludedPixels / sourcePixels) * 100 : 0;
+    const status = document.getElementById('brightnessCutoffPreviewStatus');
+    if (status) {
+        status.textContent = `${formatNumber(excludedPercent, 1)}% of visible SVG pixels are below the current cutoff and are shown in red.`;
+    }
 }
 
 function updateSimulationControls() {
@@ -443,16 +571,46 @@ function updatePatternCenterMarker() {
     if (patternCenterMarker) patternCenterMarker.remove();
     patternCenterMarker = new paper.Group({ name: 'patternCenterMarker' });
     const radius = Math.max(2.5, readPositiveNumber('penThickness', 0.5) * 2);
+    const headCenter = new paper.Point(x, y - (radius * 1.7));
+    patternCenterMarker.addChild(new paper.Path.Line({
+        from: headCenter.add([0, radius * 0.85]),
+        to: [x, y],
+        strokeColor: '#f6c85f',
+        strokeWidth: 1.4
+    }));
     patternCenterMarker.addChild(new paper.Path.Circle({
-        center: [x, y], radius, strokeColor: '#f6c85f', strokeWidth: 1.2
+        center: headCenter,
+        radius,
+        fillColor: '#f6c85f',
+        strokeColor: '#5f4300',
+        strokeWidth: 0.8
     }));
-    patternCenterMarker.addChild(new paper.Path.Line({
-        from: [x - radius * 1.5, y], to: [x + radius * 1.5, y], strokeColor: '#f6c85f', strokeWidth: 1
+    patternCenterMarker.addChild(new paper.Path.Circle({
+        center: headCenter,
+        radius: radius * 0.34,
+        fillColor: '#5f4300'
     }));
-    patternCenterMarker.addChild(new paper.Path.Line({
-        from: [x, y - radius * 1.5], to: [x, y + radius * 1.5], strokeColor: '#f6c85f', strokeWidth: 1
+    patternCenterMarker.addChild(new paper.Path.Circle({
+        center: [x, y],
+        radius: Math.max(0.6, radius * 0.18),
+        fillColor: '#f6c85f',
+        strokeColor: '#5f4300',
+        strokeWidth: 0.5
     }));
     patternCenterMarker.bringToFront();
+}
+
+function setPatternCenterPicking(active) {
+    pickingPatternCenter = Boolean(active);
+    const button = document.getElementById('pickPatternCenterBtn');
+    const canvas = document.getElementById('canvas');
+    button.classList.toggle('is-active', pickingPatternCenter);
+    button.setAttribute('aria-pressed', pickingPatternCenter ? 'true' : 'false');
+    button.textContent = pickingPatternCenter ? 'Click Canvas to Drop Pin' : 'Pick Center on Canvas';
+    canvas.classList.toggle('picking-pattern-center', pickingPatternCenter);
+    if (pickingPatternCenter) {
+        document.getElementById('generationStatus').textContent = 'Click inside the machine workspace to drop the pattern-center pin. Press Escape to cancel.';
+    }
 }
 
 function setPatternCenterToWorkspace() {
@@ -460,8 +618,10 @@ function setPatternCenterToWorkspace() {
     const bedY = readPositiveNumber('bedY', 297);
     document.getElementById('patternCenterX').value = formatNumber(bedX / 2, 3);
     document.getElementById('patternCenterY').value = formatNumber(bedY / 2, 3);
+    setPatternCenterPicking(false);
     saveMachineSettings();
     updatePatternCenterMarker();
+    document.getElementById('generationStatus').textContent = 'Pattern center set to the workspace center.';
 }
 
 function updatePatternControlVisibility() {
@@ -524,6 +684,8 @@ function initWorkspace(resetView = false) {
         paper.view.center = new paper.Point(bedX / 2, bedY / 2);
     }
     updateZoomUi();
+    updatePatternCenterMarker();
+    scheduleBrightnessCutoffPreview();
 }
 
 function getRotatedDimensions(width, height, rotationDegrees) {
@@ -660,9 +822,23 @@ document.getElementById('autoPreviewGeneration').addEventListener('change', () =
     saveUiSettings();
     syncSourceSvgVisibility();
 });
-document.getElementById('hideSvgDuringSimulation').addEventListener('change', () => {
+document.getElementById('hideSourceSvg').addEventListener('change', () => {
     saveUiSettings();
     syncSourceSvgVisibility();
+});
+document.getElementById('showBrightnessCutoffPreview').addEventListener('change', () => {
+    saveUiSettings();
+    scheduleBrightnessCutoffPreview(0);
+});
+document.getElementById('centerPatternBtn').addEventListener('click', setPatternCenterToWorkspace);
+document.getElementById('pickPatternCenterBtn').addEventListener('click', () => {
+    setPatternCenterPicking(!pickingPatternCenter);
+});
+['patternCenterX', 'patternCenterY'].forEach(id => {
+    document.getElementById(id).addEventListener('input', updatePatternCenterMarker);
+});
+['brightnessCutoff', 'densityFudge'].forEach(id => {
+    document.getElementById(id).addEventListener('input', () => scheduleBrightnessCutoffPreview());
 });
 COLLAPSIBLE_SECTION_IDS.forEach(id => {
     const section = document.getElementById(id);
@@ -686,6 +862,30 @@ document.getElementById('canvas').addEventListener('wheel', event => {
     const factor = event.deltaY < 0 ? 1.12 : (1 / 1.12);
     setCanvasZoomPercent(canvasZoomPercent * factor, anchor);
 }, { passive: false });
+document.getElementById('canvas').addEventListener('pointerdown', event => {
+    if (!pickingPatternCenter) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const viewPoint = new paper.Point(event.clientX - rect.left, event.clientY - rect.top);
+    const projectPoint = paper.view.viewToProject(viewPoint);
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    const x = Math.max(0, Math.min(bedX, projectPoint.x));
+    const y = Math.max(0, Math.min(bedY, projectPoint.y));
+    document.getElementById('patternCenterX').value = formatNumber(x, 3);
+    document.getElementById('patternCenterY').value = formatNumber(y, 3);
+    saveMachineSettings();
+    updatePatternCenterMarker();
+    setPatternCenterPicking(false);
+    document.getElementById('generationStatus').textContent = `Pattern center pinned at X${formatNumber(x, 2)}, Y${formatNumber(y, 2)} mm.`;
+});
+document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && pickingPatternCenter) {
+        setPatternCenterPicking(false);
+        document.getElementById('generationStatus').textContent = 'Pattern-center selection cancelled.';
+    }
+});
 renderLayerControls();
 
 // --- FILE UPLOAD ---
@@ -781,6 +981,8 @@ function applyTransforms() {
     workingSVG.rotate(rotation);
     workingSVG.position = new paper.Point(posX, posY);
     syncSourceSvgVisibility();
+    updatePatternCenterMarker();
+    scheduleBrightnessCutoffPreview();
 }
 
 // --- API GENERATION ---
@@ -792,6 +994,8 @@ const loadingProgress = document.getElementById('loadingProgress');
 const loadingDetails = document.getElementById('loadingDetails');
 const generationStatus = document.getElementById('generationStatus');
 const gcodeOutput = document.getElementById('gcodeOutput');
+const exportGcodeButton = document.getElementById('exportGcodeBtn');
+const gcodeLineCount = document.getElementById('gcodeLineCount');
 
 function sleep(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -877,6 +1081,12 @@ function clearLoading() {
     loadingProgress.removeAttribute('value');
     loadingDetails.textContent = '';
     updateGenerationButtons(false, false);
+    updateExportAvailability();
+}
+
+function updateExportAvailability() {
+    if (!exportGcodeButton) return;
+    exportGcodeButton.disabled = Boolean(activeJobId) || gcodeLines.length === 0;
 }
 
 function setGcodeLines(lines) {
@@ -888,6 +1098,8 @@ function setGcodeLines(lines) {
         offset += line.length + 1;
     }
     gcodeOutput.value = gcodeLines.join('\n');
+    if (gcodeLineCount) gcodeLineCount.textContent = `${gcodeLines.length.toLocaleString()} lines`;
+    updateExportAvailability();
 }
 
 function highlightGcodeLine(lineIndex) {
@@ -905,17 +1117,67 @@ function highlightGcodeLine(lineIndex) {
 }
 
 function currentGcodeSettings() {
+    const sourceFile = document.getElementById('svgInput').files[0];
     return {
+        sourceFilename: sourceFile?.name || 'uploaded.svg',
+        enabledLayers: getEnabledLayerNames(),
+        bedX: readPositiveNumber('bedX', 210),
+        bedY: readPositiveNumber('bedY', 297),
         zMode: document.getElementById('zMode').value,
         zUp: document.getElementById('zUp').value,
         zDown: document.getElementById('zDown').value,
         xyFeedRate: Number.parseInt(document.getElementById('xyFeedRate').value, 10) || 2000,
         zPlungeRate: Number.parseInt(document.getElementById('zPlungeRate').value, 10) || 300,
+        penThickness: readPositiveNumber('penThickness', 0.5),
+        svgScale: Number.parseFloat(document.getElementById('svgScale').value) || 100,
+        svgScaleMode: 'absolute',
+        svgRotate: Number.parseFloat(document.getElementById('svgRotate').value) || 0,
+        svgPosX: Number.parseFloat(document.getElementById('svgPosX').value) || 0,
+        svgPosY: Number.parseFloat(document.getElementById('svgPosY').value) || 0,
+        densityFudge: Number.parseFloat(document.getElementById('densityFudge').value) || 0,
+        brightnessCutoff: Number.parseFloat(document.getElementById('brightnessCutoff').value) || 0,
+        patternLayout: document.getElementById('patternLayout').value,
+        patternSpacing: readPositiveNumber('patternSpacing', 1),
+        patternAngle: Number.parseFloat(document.getElementById('patternAngle').value) || 0,
+        patternCenterX: Number.parseFloat(document.getElementById('patternCenterX').value) || 0,
+        patternCenterY: Number.parseFloat(document.getElementById('patternCenterY').value) || 0,
+        patternClockwise: document.getElementById('patternClockwise').checked,
+        waveform: document.getElementById('waveform').value,
+        waveAmplitude: Math.max(0, Number.parseFloat(document.getElementById('waveAmplitude').value) || 0),
+        waveLength: readPositiveNumber('waveLength', 3),
+        brightnessModulation: document.getElementById('brightnessModulation').value,
     };
 }
 
-function buildGcodeHeader(settings) {
+function gcodeCommentValue(value) {
+    return String(value ?? '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function gcodeFixed(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(3) : '0.000';
+}
+
+function buildGcodeHeader(settings, pathCount = null) {
+    const layers = settings.enabledLayers?.length
+        ? settings.enabledLayers.map(gcodeCommentValue).join(', ')
+        : 'All visible layers';
+    const direction = settings.patternClockwise ? 'clockwise' : 'counterclockwise';
+    const toolpathCount = Number.isInteger(pathCount) ? String(pathCount) : 'live preview';
     return [
+        '; HatchPlot generated G-code',
+        `; Source SVG: ${gcodeCommentValue(settings.sourceFilename)}`,
+        `; Enabled layers: ${layers}`,
+        `; Machine bed: ${gcodeFixed(settings.bedX)} x ${gcodeFixed(settings.bedY)} mm`,
+        `; Z control: ${gcodeCommentValue(settings.zMode)}; up=${gcodeCommentValue(settings.zUp)}; down=${gcodeCommentValue(settings.zDown)}; plunge=${settings.zPlungeRate} mm/min`,
+        `; XY feed rate: ${settings.xyFeedRate} mm/min`,
+        `; Pen size: ${gcodeFixed(settings.penThickness)} mm`,
+        `; SVG transform: scale=${gcodeFixed(settings.svgScale)}% (${gcodeCommentValue(settings.svgScaleMode)}); rotation=${gcodeFixed(settings.svgRotate)} deg; center=(${gcodeFixed(settings.svgPosX)}, ${gcodeFixed(settings.svgPosY)}) mm`,
+        `; Brightness: cutoff=${gcodeFixed(settings.brightnessCutoff)}; density fudge=${Number(settings.densityFudge) >= 0 ? '+' : ''}${gcodeFixed(settings.densityFudge)}; modulation=${gcodeCommentValue(settings.brightnessModulation)}`,
+        `; Pattern: layout=${gcodeCommentValue(settings.patternLayout)}; spacing=${gcodeFixed(settings.patternSpacing)} mm; angle=${gcodeFixed(settings.patternAngle)} deg; center=(${gcodeFixed(settings.patternCenterX)}, ${gcodeFixed(settings.patternCenterY)}) mm; direction=${direction}`,
+        `; Waveform: type=${gcodeCommentValue(settings.waveform)}; amplitude=${gcodeFixed(settings.waveAmplitude)} mm; wavelength=${gcodeFixed(settings.waveLength)} mm`,
+        `; Toolpaths: ${toolpathCount}`,
+        '; End HatchPlot header',
         'G21',
         'G90',
         settings.zMode === 'stepper' ? `G0 Z${settings.zUp}` : `M3 S${settings.zUp}`
@@ -951,9 +1213,9 @@ function appendGcodeForPaths(paths) {
     setGcodeLines(lines);
 }
 
-function calculateFinalGcodeRanges(paths) {
+function calculateFinalGcodeRanges(paths, headerLineCount = 3) {
     generatedPathGcodeRanges = [];
-    let lineIndex = 3;
+    let lineIndex = Math.max(0, Number.parseInt(headerLineCount, 10) || 3);
     for (const path of paths) {
         const pointCount = Math.max(0, path.length - 1);
         generatedPathGcodeRanges.push({
@@ -1168,7 +1430,7 @@ async function waitForGeneration(jobId) {
 function displayGeneratedResult(data) {
     clearGeneratedPreview(false, false);
     setGcodeLines(String(data.gcode || '').split(/\r?\n/));
-    calculateFinalGcodeRanges(data.paths || []);
+    calculateFinalGcodeRanges(data.paths || [], data.stats?.gcode_header_lines);
     appendPaperPaths(data.paths || [], false);
 
     const autoPreview = document.getElementById('autoPreviewGeneration').checked;
@@ -1274,6 +1536,28 @@ cancelGenerateButton.addEventListener('click', async () => {
         alert(`Unable to cancel the current generation job:\n\n${error.message}`);
     }
 });
+
+function exportGcode() {
+    const content = gcodeOutput.value.trim();
+    if (!content || activeJobId) return;
+
+    const sourceName = document.getElementById('svgInput').files[0]?.name || 'hatchplot';
+    const baseName = sourceName
+        .replace(/\.[^.]+$/, '')
+        .replace(/[^a-zA-Z0-9._-]+/g, '-')
+        .replace(/^-+|-+$/g, '') || 'hatchplot';
+    const blob = new Blob([`${content}\n`], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${baseName}-hatchplot.gcode`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+exportGcodeButton.addEventListener('click', exportGcode);
 
 // --- SIMULATION LOOP ---
 function startSimulation(startIndex = 0, resetAll = true) {
