@@ -599,6 +599,332 @@ def _publish_live_preview(
 
 
 
+
+def _simplify_trace(points: list[tuple[float, float]], tolerance: float, closed: bool = False) -> list[list[float]]:
+    """Simplify a raster-derived trace while preserving its visible geometry."""
+    if len(points) < 2:
+        return []
+    source = points
+    if closed and points[0] != points[-1]:
+        source = [*points, points[0]]
+    simplified = LineString(source).simplify(max(0.0, tolerance), preserve_topology=False)
+    if simplified.is_empty:
+        return []
+    if isinstance(simplified, MultiLineString):
+        line = max(simplified.geoms, key=lambda item: item.length, default=None)
+        if line is None:
+            return []
+    elif isinstance(simplified, LineString):
+        line = simplified
+    else:
+        return []
+    coordinates = [[round(float(x), 4), round(float(y), 4)] for x, y in line.coords]
+    if closed and len(coordinates) >= 3 and coordinates[0] != coordinates[-1]:
+        coordinates.append(coordinates[0][:])
+    return coordinates if len(coordinates) >= 2 else []
+
+
+def _trace_pixel_graph(
+    adjacency: dict[int, set[int]],
+    point_for_id: Any,
+    *,
+    simplify_tolerance: float,
+    minimum_length: float,
+) -> list[list[list[float]]]:
+    """Convert an undirected pixel graph into plotter-friendly polylines."""
+    visited: set[tuple[int, int]] = set()
+    paths: list[list[list[float]]] = []
+
+    def edge_key(first: int, second: int) -> tuple[int, int]:
+        return (first, second) if first < second else (second, first)
+
+    def trace(start: int, neighbor: int) -> list[int]:
+        result = [start]
+        previous = start
+        current = neighbor
+        visited.add(edge_key(start, neighbor))
+        while True:
+            result.append(current)
+            candidates = [
+                item for item in adjacency.get(current, ())
+                if item != previous and edge_key(current, item) not in visited
+            ]
+            if len(adjacency.get(current, ())) != 2 or not candidates:
+                break
+            next_item = candidates[0]
+            visited.add(edge_key(current, next_item))
+            previous, current = current, next_item
+        return result
+
+    # Endpoints and junctions first, then closed loops left in the graph.
+    starts = [node for node, neighbors in adjacency.items() if len(neighbors) != 2]
+    for start in starts:
+        for neighbor in tuple(adjacency.get(start, ())):
+            if edge_key(start, neighbor) in visited:
+                continue
+            node_path = trace(start, neighbor)
+            points = [point_for_id(node) for node in node_path]
+            if len(points) < 2 or LineString(points).length < minimum_length:
+                continue
+            simplified = _simplify_trace(points, simplify_tolerance, closed=False)
+            if simplified:
+                paths.append(simplified)
+
+    for start, neighbors in adjacency.items():
+        for neighbor in tuple(neighbors):
+            if edge_key(start, neighbor) in visited:
+                continue
+            node_path = trace(start, neighbor)
+            closed = len(node_path) > 2 and node_path[-1] in adjacency.get(node_path[0], ())
+            if closed:
+                visited.add(edge_key(node_path[-1], node_path[0]))
+            points = [point_for_id(node) for node in node_path]
+            if len(points) < 2 or LineString(points).length < minimum_length:
+                continue
+            simplified = _simplify_trace(points, simplify_tolerance, closed=closed)
+            if simplified:
+                paths.append(simplified)
+    return paths
+
+
+def _thin_binary_linework(mask: np.ndarray, maximum_iterations: int = 96) -> np.ndarray:
+    """Zhang-Suen thinning for browser-rendered SVG linework."""
+    image = mask.astype(bool, copy=True)
+    if image.shape[0] < 3 or image.shape[1] < 3:
+        return image
+
+    for _ in range(maximum_iterations):
+        changed = False
+        for first_pass in (True, False):
+            padded = np.pad(image, 1, mode="constant", constant_values=False)
+            p2 = padded[:-2, 1:-1]
+            p3 = padded[:-2, 2:]
+            p4 = padded[1:-1, 2:]
+            p5 = padded[2:, 2:]
+            p6 = padded[2:, 1:-1]
+            p7 = padded[2:, :-2]
+            p8 = padded[1:-1, :-2]
+            p9 = padded[:-2, :-2]
+            neighbors = (p2.astype(np.uint8) + p3 + p4 + p5 + p6 + p7 + p8 + p9)
+            transitions = (
+                ((~p2) & p3).astype(np.uint8)
+                + ((~p3) & p4)
+                + ((~p4) & p5)
+                + ((~p5) & p6)
+                + ((~p6) & p7)
+                + ((~p7) & p8)
+                + ((~p8) & p9)
+                + ((~p9) & p2)
+            )
+            removable = image & (neighbors >= 2) & (neighbors <= 6) & (transitions == 1)
+            if first_pass:
+                removable &= ~(p2 & p4 & p6)
+                removable &= ~(p4 & p6 & p8)
+            else:
+                removable &= ~(p2 & p4 & p8)
+                removable &= ~(p2 & p6 & p8)
+            if np.any(removable):
+                image[removable] = False
+                changed = True
+        if not changed:
+            break
+    return image
+
+
+def _vectorize_skeleton(
+    skeleton: np.ndarray,
+    bed_x: float,
+    bed_y: float,
+    simplify_tolerance: float,
+    minimum_length: float,
+) -> list[list[list[float]]]:
+    height, width = skeleton.shape
+    rows, columns = np.nonzero(skeleton)
+    node_ids = {int(row) * width + int(column) for row, column in zip(rows, columns)}
+    adjacency: dict[int, set[int]] = {node: set() for node in node_ids}
+    offsets = (-width - 1, -width, -width + 1, -1, 1, width - 1, width, width + 1)
+    for node in node_ids:
+        row, column = divmod(node, width)
+        for offset in offsets:
+            other = node + offset
+            if other not in node_ids:
+                continue
+            other_row, other_column = divmod(other, width)
+            row_delta = other_row - row
+            column_delta = other_column - column
+            if abs(row_delta) > 1 or abs(column_delta) > 1:
+                continue
+            if row_delta and column_delta:
+                # Do not add a diagonal shortcut when the skeleton already has an
+                # orthogonal connection around that corner. This keeps smooth curves
+                # as one degree-2 loop instead of splitting them into tiny branches.
+                horizontal = row * width + other_column
+                vertical = other_row * width + column
+                if horizontal in node_ids or vertical in node_ids:
+                    continue
+            adjacency[node].add(other)
+
+    def point_for_id(node: int) -> tuple[float, float]:
+        row, column = divmod(node, width)
+        return (((column + 0.5) / width) * bed_x, ((row + 0.5) / height) * bed_y)
+
+    return _trace_pixel_graph(
+        adjacency,
+        point_for_id,
+        simplify_tolerance=simplify_tolerance,
+        minimum_length=minimum_length,
+    )
+
+
+def _vectorize_boundaries(
+    mask: np.ndarray,
+    bed_x: float,
+    bed_y: float,
+    simplify_tolerance: float,
+    minimum_length: float,
+) -> list[list[list[float]]]:
+    height, width = mask.shape
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    top = mask & ~padded[:-2, 1:-1]
+    right = mask & ~padded[1:-1, 2:]
+    bottom = mask & ~padded[2:, 1:-1]
+    left = mask & ~padded[1:-1, :-2]
+    grid_width = width + 1
+    adjacency: dict[int, set[int]] = {}
+
+    def add_edge(first: int, second: int) -> None:
+        adjacency.setdefault(first, set()).add(second)
+        adjacency.setdefault(second, set()).add(first)
+
+    for row, column in zip(*np.nonzero(top)):
+        add_edge(int(row) * grid_width + int(column), int(row) * grid_width + int(column) + 1)
+    for row, column in zip(*np.nonzero(right)):
+        add_edge(int(row) * grid_width + int(column) + 1, (int(row) + 1) * grid_width + int(column) + 1)
+    for row, column in zip(*np.nonzero(bottom)):
+        add_edge((int(row) + 1) * grid_width + int(column) + 1, (int(row) + 1) * grid_width + int(column))
+    for row, column in zip(*np.nonzero(left)):
+        add_edge((int(row) + 1) * grid_width + int(column), int(row) * grid_width + int(column))
+
+    def point_for_id(node: int) -> tuple[float, float]:
+        row, column = divmod(node, grid_width)
+        return ((column / width) * bed_x, (row / height) * bed_y)
+
+    return _trace_pixel_graph(
+        adjacency,
+        point_for_id,
+        simplify_tolerance=simplify_tolerance,
+        minimum_length=minimum_length,
+    )
+
+
+def _generate_outline_paths_from_raster(
+    outline_map: bytes,
+    params: dict[str, Any],
+    progress: MutableMapping[str, Any] | None = None,
+    preview_queue: Any | None = None,
+) -> tuple[list[list[list[float]]], dict[str, Any]]:
+    """Trace the browser-rendered SVG so output matches the visible canvas."""
+    bed_x = float(params["bedX"])
+    bed_y = float(params["bedY"])
+    pen_thickness = float(params.get("penThickness", 0.5))
+    _set_progress(progress, phase="outline-decoding", percent=3.0, detail="Decoding the browser-rendered outline map...")
+    _check_cancel_requested(progress)
+    try:
+        image = Image.open(io.BytesIO(outline_map))
+        image.load()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise GenerationError(f"Unable to read the rendered outline map: {exc}") from exc
+    if image.width * image.height > MAX_BRIGHTNESS_MAP_PIXELS:
+        raise GenerationLimitError(f"The outline map contains more than {MAX_BRIGHTNESS_MAP_PIXELS:,} pixels.")
+
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.float32)
+    luminance = (0.299 * rgba[:, :, 0] + 0.587 * rgba[:, :, 1] + 0.114 * rgba[:, :, 2]) / 255.0
+    darkness = np.clip((1.0 - luminance) * (rgba[:, :, 3] / 255.0), 0.0, 1.0)
+    maximum_darkness = float(np.max(darkness)) if darkness.size else 0.0
+    if maximum_darkness < 0.01:
+        raise GenerationError("The rendered SVG does not contain visible linework to trace.")
+    threshold = max(0.025, min(0.35, maximum_darkness * 0.18))
+    mask = darkness >= threshold
+
+    # Remove isolated antialiasing specks without eroding valid one-pixel lines.
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    neighbor_count = sum(
+        padded[1 + row_offset:1 + row_offset + mask.shape[0], 1 + column_offset:1 + column_offset + mask.shape[1]]
+        for row_offset, column_offset in (
+            (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)
+        )
+    )
+    mask &= neighbor_count >= 1
+    ink_pixels = int(np.count_nonzero(mask))
+    if ink_pixels < 2:
+        raise GenerationError("The rendered SVG does not contain enough visible linework to trace.")
+
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    interior = mask.copy()
+    for row_offset, column_offset in (
+        (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)
+    ):
+        interior &= padded[1 + row_offset:1 + row_offset + mask.shape[0], 1 + column_offset:1 + column_offset + mask.shape[1]]
+    interior_fraction = float(np.count_nonzero(interior)) / ink_pixels
+    trace_method = "centerline" if interior_fraction < 0.82 else "boundary"
+    pixel_mm = max(bed_x / max(1, image.width), bed_y / max(1, image.height))
+    simplify_tolerance = max(pixel_mm * 0.65, pen_thickness * 0.06, 0.015)
+    minimum_length = max(pixel_mm * 2.0, pen_thickness * 0.75, 0.08)
+
+    _set_progress(
+        progress,
+        phase="outline-tracing",
+        percent=18.0,
+        detail=(
+            "Extracting centerlines from visible SVG linework..."
+            if trace_method == "centerline"
+            else "Extracting visible boundaries from filled SVG artwork..."
+        ),
+        compute_backend="numpy-cpu",
+    )
+    _check_cancel_requested(progress)
+    if trace_method == "centerline":
+        skeleton = _thin_binary_linework(mask)
+        paths = _vectorize_skeleton(skeleton, bed_x, bed_y, simplify_tolerance, minimum_length)
+    else:
+        paths = _vectorize_boundaries(mask, bed_x, bed_y, simplify_tolerance, minimum_length)
+
+    if not paths:
+        raise GenerationError("The rendered SVG linework could not be converted into continuous outline paths.")
+    toolpath_points = sum(len(path) for path in paths)
+    if len(paths) > MAX_HATCH_PATHS:
+        raise GenerationLimitError(
+            f"The SVG generated more than {MAX_HATCH_PATHS:,} outline paths. Reduce its complexity or scale."
+        )
+    if toolpath_points > MAX_TOOLPATH_POINTS:
+        raise GenerationLimitError(
+            f"The SVG generated more than {MAX_TOOLPATH_POINTS:,} outline points. Reduce its complexity or scale."
+        )
+
+    preview_state = {"points": 0, "chunks": 0}
+    _publish_live_preview(preview_queue, paths, preview_state)
+    _set_progress(
+        progress,
+        phase="outline-tracing",
+        percent=90.0,
+        completed=len(paths),
+        total=len(paths),
+        detail=f"Traced {len(paths):,} visible {trace_method} path{'s' if len(paths) != 1 else ''}.",
+        compute_backend="numpy-cpu",
+    )
+    return paths, {
+        "outline_trace_source": "browser-rendered-raster",
+        "outline_trace_method": trace_method,
+        "outline_threshold": round(threshold, 4),
+        "outline_ink_pixels": ink_pixels,
+        "outline_interior_fraction": round(interior_fraction, 4),
+        "outline_sampling_mm": round(pixel_mm, 4),
+        "compute_backend": "numpy-cpu",
+        "gpu_accelerated": False,
+        "live_preview_points": preview_state["points"],
+    }
+
+
 def _waveform_value(waveform: str, phase: float) -> float:
     wrapped = phase % 1.0
     if waveform == "straight":
@@ -1065,7 +1391,7 @@ def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
         f"; SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({display_svg_x:.3f}, {display_svg_y:.3f}) mm",
     ]
     if generation_mode == "outline":
-        lines.append("; Outline: traces SVG stroke centerlines and boundaries of filled shapes")
+        lines.append("; Outline: traces the browser-rendered SVG; thin linework becomes centerlines and filled artwork becomes boundaries")
     else:
         lines.extend([
             f"; Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
@@ -1153,6 +1479,53 @@ def generate_toolpath(
             total=len(compiled_paths),
             detail="Toolpath generation completed.",
             compute_backend=raster_stats.get("compute_backend"),
+            force_eta_zero=True,
+        )
+        return result
+
+    if generation_mode == "outline" and brightness_map is not None:
+        compiled_paths, outline_stats = _generate_outline_paths_from_raster(
+            brightness_map, params, progress, preview_queue
+        )
+        _set_progress(
+            progress,
+            phase="gcode",
+            percent=94.0,
+            completed=0,
+            total=len(compiled_paths),
+            detail="Compiling visible outline paths into G-code...",
+            compute_backend=outline_stats.get("compute_backend"),
+        )
+        _check_cancel_requested(progress)
+        gcode = _compile_gcode(compiled_paths, params)
+        duration = time.perf_counter() - started
+        toolpath_points = sum(len(path) for path in compiled_paths)
+        result = {
+            "gcode": "\n".join(gcode),
+            "paths": compiled_paths,
+            "stats": {
+                "duration_seconds": round(duration, 3),
+                "drawable_elements": None,
+                "hatch_paths": 0,
+                "outline_paths": len(compiled_paths),
+                "continuous_paths": len(compiled_paths),
+                "generation_mode": generation_mode,
+                "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
+                "toolpath_points": toolpath_points,
+                "gcode_lines": len(gcode),
+                "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
+                "pen_thickness_mm": float(params.get("penThickness", 0.5)),
+                **outline_stats,
+            },
+        }
+        _set_progress(
+            progress,
+            phase="completed",
+            percent=100.0,
+            completed=len(compiled_paths),
+            total=len(compiled_paths),
+            detail="Visible outline tracing completed.",
+            compute_backend=outline_stats.get("compute_backend"),
             force_eta_zero=True,
         )
         return result

@@ -82,7 +82,7 @@ const GENERATION_FIELD_TOOLTIPS = {
     penThickness: 'Physical pen-tip width. It sets the minimum useful carrier step-over and preview stroke width; an accurate value helps avoid redundant, muddy lines.',
     densityFudge: 'Biases sampled darkness before density gating. Positive values retain more carriers for a darker result; negative values suppress carriers for a lighter, cleaner result.',
     brightnessCutoff: 'Minimum adjusted darkness required to draw. Raising it removes more pale gray detail and noise; lowering it preserves fainter tones.',
-    generationMode: 'Brightness Hatch converts grayscale into density-modulated carriers. Outline Trace follows SVG strokes and filled-shape boundaries without brightness sampling.',
+    generationMode: 'Brightness Hatch converts grayscale into density-modulated carriers. Outline Trace follows the browser-rendered SVG, reducing line art to centerlines and filled artwork to visible boundaries.',
     patternLayout: 'Selects the base carrier geometry used to traverse the brightness map. Hover the help icon after choosing a layout for a description of that layout.',
     waveform: 'Selects the shape displaced around each base carrier. Hover the help icon after choosing a waveform for a description of that waveform.',
     patternSpacing: 'Nominal distance between adjacent layout carriers before brightness-based density gating. Smaller spacing captures more detail but creates more lines and G-code.',
@@ -104,7 +104,7 @@ const SELECT_OPTION_TOOLTIPS = {
     },
     generationMode: {
         hatch: 'Creates brightness-driven hatching or waveform carriers. Darker regions retain more lines and lighter regions retain fewer.',
-        outline: 'Traces SVG stroke centerlines and boundaries of filled shapes. Pattern, waveform, and brightness controls are ignored.'
+        outline: 'Traces the browser-rendered SVG shown on the canvas. Thin line art becomes centerlines; filled artwork becomes visible boundaries. Pattern, waveform, and brightness controls are ignored.'
     },
     patternLayout: {
         linear: 'Parallel carriers crossing the artwork. This is the most predictable general-purpose layout; Pattern Angle controls their orientation.',
@@ -1343,7 +1343,7 @@ document.getElementById('generationMode').addEventListener('change', () => {
     saveMachineSettings();
     updateGenerationModeVisibility();
     document.getElementById('generationStatus').textContent = document.getElementById('generationMode').value === 'outline'
-        ? 'Outline Trace mode selected. SVG strokes and filled-shape boundaries will be followed directly.'
+        ? 'Outline Trace mode selected. The visible browser-rendered linework will be traced directly.'
         : 'Brightness Hatch mode selected. Tone controls local line density.';
 });
 
@@ -1734,7 +1734,7 @@ function buildGcodeHeader(settings, pathCount = null) {
         `; SVG transform: scale=${gcodeFixed(settings.svgScale)}% (${gcodeCommentValue(settings.svgScaleMode)}); rotation=${gcodeFixed(settings.svgRotate)} deg; center=(${gcodeFixed(settings.svgPosX)}, ${gcodeFixed(settings.svgPosY)}) mm`,
     ];
     if (settings.generationMode === 'outline') {
-        lines.push('; Outline: traces SVG stroke centerlines and boundaries of filled shapes');
+        lines.push('; Outline: traces the browser-rendered SVG; thin linework becomes centerlines and filled artwork becomes boundaries');
     } else {
         lines.push(
             `; Brightness: cutoff=${gcodeFixed(settings.brightnessCutoff)}; density fudge=${Number(settings.densityFudge) >= 0 ? '+' : ''}${gcodeFixed(settings.densityFudge)}; modulation=${gcodeCommentValue(settings.brightnessModulation)}`,
@@ -1897,13 +1897,17 @@ async function buildGenerationFormData(penThickness) {
         waveLength = Number.isFinite(waveLength) && waveLength >= 0.05 ? waveLength : 3;
     }
 
-    const brightnessMap = generationMode === 'hatch' ? await renderBrightnessMap(penThickness) : null;
+    const renderedSourceMap = await renderBrightnessMap(penThickness);
     const svgCenter = getSvgCanvasCenter();
     const patternCenter = getPatternCanvasCenter();
     const formData = new FormData();
     const filteredSvg = new Blob([serializeSvgForGeneration(generationMode)], { type: 'image/svg+xml' });
     formData.append('file', filteredSvg, fileInput.files[0]?.name || 'filtered.svg');
-    if (brightnessMap) formData.append('brightnessMap', brightnessMap, 'brightness-map.png');
+    formData.append(
+        'brightnessMap',
+        renderedSourceMap,
+        generationMode === 'outline' ? 'outline-map.png' : 'brightness-map.png'
+    );
     formData.append('bedX', document.getElementById('bedX').value);
     formData.append('bedY', document.getElementById('bedY').value);
     formData.append('workspaceOrigin', getWorkspaceOrigin());
@@ -2041,6 +2045,7 @@ function displayGeneratedResult(data) {
         stats.pattern_layout ? `${stats.pattern_layout} layout` : null,
         stats.waveform ? `${stats.waveform} waveform` : null,
         stats.pattern_spacing_mm ? `${formatNumber(Number(stats.pattern_spacing_mm), 3)} mm layout spacing` : null,
+        stats.outline_trace_method ? `${stats.outline_trace_method} outline extraction` : null,
         stats.outline_sampling_mm ? `${formatNumber(Number(stats.outline_sampling_mm), 3)} mm outline sampling` : null,
         stats.gcode_lines ? `${Number(stats.gcode_lines).toLocaleString()} G-code lines` : null,
         stats.row_pitch_mm ? `${formatNumber(Number(stats.row_pitch_mm), 3)} mm row pitch` : null,
@@ -2067,13 +2072,13 @@ generateButton.addEventListener('click', async function() {
         const penThickness = ensurePenThickness();
         const generationMode = document.getElementById('generationMode').value;
         setLoading(
-            generationMode === 'outline' ? 'Preparing SVG outlines...' : 'Rendering a brightness map from the transformed SVG...',
+            generationMode === 'outline' ? 'Rendering the visible SVG for outline tracing...' : 'Rendering a brightness map from the transformed SVG...',
             1,
-            generationMode === 'outline' ? 'Sampling vector strokes and filled-shape boundaries' : 'Preparing the exact machine-coordinate raster'
+            generationMode === 'outline' ? 'Preparing the exact browser-rendered linework map' : 'Preparing the exact machine-coordinate raster'
         );
         const formData = await buildGenerationFormData(penThickness);
         setLoading(
-            generationMode === 'outline' ? 'Uploading SVG and starting outline tracing...' : 'Uploading SVG and starting brightness-driven generation...',
+            generationMode === 'outline' ? 'Uploading the visible linework map and starting outline tracing...' : 'Uploading SVG and starting brightness-driven generation...',
             2,
             'Starting the queued backend job'
         );
