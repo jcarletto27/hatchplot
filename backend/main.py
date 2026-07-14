@@ -86,7 +86,7 @@ async def lifespan(app: FastAPI):
         app.state.progress_manager.shutdown()
 
 
-app = FastAPI(title="Hatch Plotter API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="HatchPlot API", version="2.1.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -203,6 +203,42 @@ def _iter_lines(geometry: Any) -> Iterable[LineString]:
             yield from _iter_lines(item)
 
 
+def path_to_centerlines(element: Path, sample_step: float) -> list[LineString]:
+    """Sample SVG subpaths as open or closed centerlines for outline tracing."""
+    lines: list[LineString] = []
+    safe_step = max(0.01, float(sample_step))
+    for raw_subpath in element.as_subpaths():
+        subpath = Path(raw_subpath)
+        length = float(subpath.length())
+        if not math.isfinite(length) or length <= 0.0:
+            continue
+        point_count = max(2, min(20_000, int(math.ceil(length / safe_step))))
+        points: list[tuple[float, float]] = []
+        for index in range(point_count + 1):
+            point = subpath.point(index / point_count)
+            if not (math.isfinite(point.x) and math.isfinite(point.y)):
+                continue
+            coordinate = (float(point.x), float(point.y))
+            if not points or coordinate != points[-1]:
+                points.append(coordinate)
+        if len(points) >= 2:
+            lines.append(LineString(points))
+    return lines
+
+
+def _transform_svg_geometry(
+    geometry: Any,
+    source_center: tuple[float, float],
+    scale: float,
+    rotation: float,
+    destination: tuple[float, float],
+) -> Any:
+    geometry = affinity.translate(geometry, xoff=-source_center[0], yoff=-source_center[1])
+    geometry = affinity.scale(geometry, xfact=scale, yfact=scale, origin=(0.0, 0.0))
+    geometry = affinity.rotate(geometry, rotation, origin=(0.0, 0.0), use_radians=False)
+    return affinity.translate(geometry, xoff=destination[0], yoff=destination[1])
+
+
 def path_to_shapely(element: Path) -> Polygon | MultiPolygon | None:
     polygons: list[Polygon] = []
     for raw_subpath in element.as_subpaths():
@@ -266,35 +302,48 @@ def validate_generation_params(params: dict[str, Any]) -> None:
     if not math.isfinite(pen_thickness) or not 0.05 <= pen_thickness <= 10.0:
         raise GenerationError("penThickness must be between 0.05 and 10 mm.")
 
-    density_fudge = float(params.get("densityFudge", 0.0))
-    if not math.isfinite(density_fudge) or not -0.5 <= density_fudge <= 0.5:
-        raise GenerationError("densityFudge must be between -0.5 and 0.5.")
+    generation_mode = str(params.get("generationMode", "hatch"))
+    if generation_mode not in {"hatch", "outline"}:
+        raise GenerationError("generationMode must be hatch or outline.")
+    if params.get("workspaceOrigin", "top-left") not in {"top-left", "top-right", "bottom-left", "bottom-right"}:
+        raise GenerationError("workspaceOrigin must be top-left, top-right, bottom-left, or bottom-right.")
 
-    brightness_cutoff = float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF))
-    if not math.isfinite(brightness_cutoff) or not 0.0 <= brightness_cutoff <= 1.0:
-        raise GenerationError("brightnessCutoff must be between 0.0 and 1.0.")
+    if generation_mode == "hatch":
+        density_fudge = float(params.get("densityFudge", 0.0))
+        if not math.isfinite(density_fudge) or not -0.5 <= density_fudge <= 0.5:
+            raise GenerationError("densityFudge must be between -0.5 and 0.5.")
 
-    if params.get("patternLayout", "linear") not in {"linear", "spiral", "concentric", "radial"}:
-        raise GenerationError("patternLayout must be linear, spiral, concentric, or radial.")
-    if params.get("waveform", "zigzag") not in {"zigzag", "sawtooth", "sine", "ekg", "straight"}:
-        raise GenerationError("waveform must be zigzag, sawtooth, sine, ekg, or straight.")
-    if params.get("brightnessModulation", "both") not in {"both", "amplitude", "frequency", "none"}:
-        raise GenerationError("brightnessModulation must be both, amplitude, frequency, or none.")
-    for key, minimum, maximum in (
-        ("patternSpacing", 0.05, 500.0),
-        ("waveAmplitude", 0.0, 500.0),
-        ("waveLength", 0.05, 5000.0),
-    ):
-        value = float(params.get(key, minimum))
-        if not math.isfinite(value) or not minimum <= value <= maximum:
-            raise GenerationError(f"{key} must be between {minimum} and {maximum} mm.")
-    for key in ("patternCenterX", "patternCenterY", "patternAngle"):
-        if not math.isfinite(float(params.get(key, 0.0))):
-            raise GenerationError(f"{key} must be a finite number.")
+        brightness_cutoff = float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF))
+        if not math.isfinite(brightness_cutoff) or not 0.0 <= brightness_cutoff <= 1.0:
+            raise GenerationError("brightnessCutoff must be between 0.0 and 1.0.")
+
+        if params.get("patternLayout", "linear") not in {"linear", "spiral", "concentric", "radial"}:
+            raise GenerationError("patternLayout must be linear, spiral, concentric, or radial.")
+        if params.get("waveform", "zigzag") not in {"zigzag", "sawtooth", "sine", "ekg", "straight"}:
+            raise GenerationError("waveform must be zigzag, sawtooth, sine, ekg, or straight.")
+        if params.get("brightnessModulation", "both") not in {"both", "amplitude", "frequency", "none"}:
+            raise GenerationError("brightnessModulation must be both, amplitude, frequency, or none.")
+        for key, minimum, maximum in (
+            ("patternSpacing", 0.05, 500.0),
+            ("waveAmplitude", 0.0, 500.0),
+            ("waveLength", 0.05, 5000.0),
+        ):
+            value = float(params.get(key, minimum))
+            if not math.isfinite(value) or not minimum <= value <= maximum:
+                raise GenerationError(f"{key} must be between {minimum} and {maximum} mm.")
+        for key in ("patternCenterX", "patternCenterY", "patternAngle"):
+            if not math.isfinite(float(params.get(key, 0.0))):
+                raise GenerationError(f"{key} must be a finite number.")
 
     for key in ("svgRotate", "svgPosX", "svgPosY"):
         if not math.isfinite(float(params[key])):
             raise GenerationError(f"{key} must be a finite number.")
+
+    if generation_mode == "outline":
+        for key in ("sourceWidthMm", "sourceHeightMm"):
+            value = float(params.get(key, 0.0))
+            if value and (not math.isfinite(value) or value <= 0.0):
+                raise GenerationError(f"{key} must be a positive finite number when provided.")
 
     for key in ("xyFeedRate", "zPlungeRate"):
         value = int(params[key])
@@ -948,6 +997,8 @@ def _generate_brightness_paths(
     _set_progress(progress, phase="path-building", percent=92.0, completed=total_carriers, total=total_carriers, detail="Pattern paths are ready; compiling G-code...", compute_backend=compute_backend)
     return completed_paths, {
         "source": "browser-brightness-map",
+        "generation_mode": "hatch",
+        "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
         "map_width": rgba.width,
         "map_height": rgba.height,
         "carrier_count": total_carriers,
@@ -976,6 +1027,15 @@ def _gcode_comment_value(value: Any) -> str:
     return " ".join(text.replace("\r", " ").replace("\n", " ").split())
 
 
+def _workspace_output_point(x: float, y: float, params: dict[str, Any]) -> tuple[float, float]:
+    bed_x = float(params["bedX"])
+    bed_y = float(params["bedY"])
+    origin = str(params.get("workspaceOrigin", "top-left"))
+    output_x = bed_x - x if origin.endswith("right") else x
+    output_y = bed_y - y if origin.startswith("bottom") else y
+    return output_x, output_y
+
+
 def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
     layers = params.get("enabledLayers") or []
     if isinstance(layers, str):
@@ -983,25 +1043,42 @@ def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
     else:
         layers_text = ", ".join(_gcode_comment_value(layer) for layer in layers) or "All visible layers"
 
+    generation_mode = str(params.get("generationMode", "hatch"))
+    workspace_origin = str(params.get("workspaceOrigin", "top-left"))
+    display_svg_x, display_svg_y = _workspace_output_point(float(params["svgPosX"]), float(params["svgPosY"]), params)
+    display_center_x, display_center_y = _workspace_output_point(
+        float(params.get("patternCenterX", 0.0)),
+        float(params.get("patternCenterY", 0.0)),
+        params,
+    )
     direction = "clockwise" if bool(params.get("patternClockwise", True)) else "counterclockwise"
     lines = [
         "; HatchPlot generated G-code",
         f"; Source SVG: {_gcode_comment_value(params.get('sourceFilename', 'uploaded.svg'))}",
         f"; Enabled layers: {_gcode_comment_value(layers_text)}",
         f"; Machine bed: {float(params['bedX']):.3f} x {float(params['bedY']):.3f} mm",
+        f"; Workspace origin: {workspace_origin}",
+        f"; Generation mode: {generation_mode}",
         f"; Z control: {_gcode_comment_value(params['zMode'])}; up={_gcode_comment_value(params['zUp'])}; down={_gcode_comment_value(params['zDown'])}; plunge={int(params['zPlungeRate'])} mm/min",
         f"; XY feed rate: {int(params['xyFeedRate'])} mm/min",
         f"; Pen size: {float(params.get('penThickness', 0.5)):.3f} mm",
-        f"; SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({float(params['svgPosX']):.3f}, {float(params['svgPosY']):.3f}) mm",
-        f"; Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
-        f"; Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={float(params.get('patternSpacing', 1.0)):.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({float(params.get('patternCenterX', 0.0)):.3f}, {float(params.get('patternCenterY', 0.0)):.3f}) mm; direction={direction}",
-        f"; Waveform: type={_gcode_comment_value(params.get('waveform', 'zigzag'))}; amplitude={float(params.get('waveAmplitude', 0.5)):.3f} mm; wavelength={float(params.get('waveLength', 3.0)):.3f} mm",
+        f"; SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({display_svg_x:.3f}, {display_svg_y:.3f}) mm",
+    ]
+    if generation_mode == "outline":
+        lines.append("; Outline: traces SVG stroke centerlines and boundaries of filled shapes")
+    else:
+        lines.extend([
+            f"; Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
+            f"; Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={float(params.get('patternSpacing', 1.0)):.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({display_center_x:.3f}, {display_center_y:.3f}) mm; direction={direction}",
+            f"; Waveform: type={_gcode_comment_value(params.get('waveform', 'zigzag'))}; amplitude={float(params.get('waveAmplitude', 0.5)):.3f} mm; wavelength={float(params.get('waveLength', 3.0)):.3f} mm",
+        ])
+    lines.extend([
         f"; Toolpaths: {path_count}",
         "; End HatchPlot header",
         "G21",
         "G90",
         f"G0 Z{params['zUp']}" if params["zMode"] == "stepper" else f"M3 S{params['zUp']}",
-    ]
+    ])
     return lines
 
 
@@ -1014,12 +1091,13 @@ def _compile_gcode(paths: list[list[list[float]]], params: dict[str, Any]) -> li
 
     gcode = _gcode_preamble(params, len(paths))
     for path in paths:
-        first = path[0]
-        gcode.append(f"G0 X{first[0]:.2f} Y{first[1]:.2f}")
+        first_x, first_y = _workspace_output_point(float(path[0][0]), float(path[0][1]), params)
+        gcode.append(f"G0 X{first_x:.2f} Y{first_y:.2f}")
         gcode.append(f"G1 Z{z_down} F{z_plunge_rate}" if z_mode == "stepper" else f"M3 S{z_down}")
         for point_index, (x, y) in enumerate(path[1:]):
+            output_x, output_y = _workspace_output_point(float(x), float(y), params)
             feed = f" F{xy_feed_rate}" if point_index == 0 else ""
-            gcode.append(f"G1 X{x:.2f} Y{y:.2f}{feed}")
+            gcode.append(f"G1 X{output_x:.2f} Y{output_y:.2f}{feed}")
         gcode.append(f"G0 Z{z_up}" if z_mode == "stepper" else f"M3 S{z_up}")
     gcode.append("G0 X0 Y0")
     return gcode
@@ -1036,7 +1114,8 @@ def generate_toolpath(
     _check_cancel_requested(progress)
     validate_generation_params(params)
 
-    if brightness_map is not None:
+    generation_mode = str(params.get("generationMode", "hatch"))
+    if generation_mode == "hatch" and brightness_map is not None:
         compiled_paths, raster_stats = _generate_brightness_paths(brightness_map, params, progress, preview_queue)
         _set_progress(
             progress,
@@ -1093,19 +1172,46 @@ def generate_toolpath(
     min_x, min_y, max_x, max_y = map(float, bbox)
     svg_width = max_x - min_x
     svg_height = max_y - min_y
-    if svg_width <= 0 or svg_height <= 0:
+    parsed_width = float(getattr(parsed_svg, "width", 0.0) or 0.0)
+    parsed_height = float(getattr(parsed_svg, "height", 0.0) or 0.0)
+    if generation_mode == "outline":
+        # Valid line art may be a single horizontal or vertical open stroke, whose
+        # geometry bounds have zero height or width. Only reject a point-like SVG.
+        if svg_width <= 0 and svg_height <= 0:
+            raise GenerationError("The SVG does not contain a traceable line or boundary.")
+    elif svg_width <= 0 or svg_height <= 0:
         raise GenerationError("The SVG width and height must be greater than zero.")
 
     bed_x = float(params["bedX"])
     bed_y = float(params["bedY"])
-    fit_scale = min((bed_x * 0.9) / svg_width, (bed_y * 0.9) / svg_height)
+    fit_scale = min(
+        (bed_x * 0.9) / max(svg_width, 1e-9),
+        (bed_y * 0.9) / max(svg_height, 1e-9),
+    )
     requested_scale = float(params["svgScale"]) / 100.0
     scale_mode = str(params.get("svgScaleMode", "fit-relative"))
-    # New browser clients use absolute percentage scaling: 100% preserves the
-    # SVG's imported size. Older API clients retain the previous fit-relative
-    # behavior unless they explicitly request absolute scaling.
-    scale = requested_scale if scale_mode == "absolute" else fit_scale * requested_scale
-    source_center = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
+    source_width_mm = float(params.get("sourceWidthMm", 0.0) or 0.0)
+    source_height_mm = float(params.get("sourceHeightMm", 0.0) or 0.0)
+    # Browser outline jobs include the imported physical size because SVG parsers
+    # normalize CSS units to px. This maps parsed coordinates back to millimeters
+    # before applying the user's percentage scale.
+    if generation_mode == "outline" and parsed_width > 0.0 and parsed_height > 0.0:
+        if source_width_mm > 0.0 and source_height_mm > 0.0:
+            physical_scale = min(source_width_mm / parsed_width, source_height_mm / parsed_height)
+        else:
+            # svgelements normalizes SVG/CSS lengths to 96-DPI CSS pixels.
+            physical_scale = 25.4 / 96.0
+        scale = physical_scale * requested_scale
+    else:
+        # New browser clients use absolute percentage scaling: 100% preserves the
+        # SVG's imported size. Older API clients retain the previous fit-relative
+        # behavior unless they explicitly request absolute scaling.
+        scale = requested_scale if scale_mode == "absolute" else fit_scale * requested_scale
+    source_center = (
+        (parsed_width / 2.0, parsed_height / 2.0)
+        if generation_mode == "outline" and parsed_width > 0.0 and parsed_height > 0.0
+        else ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
+    )
     destination = (float(params["svgPosX"]), float(params["svgPosY"]))
     rotation = float(params["svgRotate"])
     machine_bed = box(0.0, 0.0, bed_x, bed_y)
@@ -1130,7 +1236,7 @@ def generate_toolpath(
         percent=8.0,
         completed=0,
         total=total_elements,
-        detail=f"Processing {total_elements:,} SVG elements...",
+        detail=f"Processing {total_elements:,} SVG elements for {generation_mode} generation...",
         compute_backend="geos-cpu",
     )
     progress_stride = max(1, total_elements // 100) if total_elements else 1
@@ -1147,7 +1253,7 @@ def generate_toolpath(
                 percent=8.0 + (fraction * 82.0),
                 completed=element_index,
                 total=total_elements,
-                detail=f"Processing SVG element {element_index + 1:,} of {total_elements:,}...",
+                detail=f"Processing SVG element {element_index + 1:,} of {total_elements:,} for {generation_mode} generation...",
                 compute_backend="geos-cpu",
             )
         fill = getattr(element, "fill", None)
@@ -1155,30 +1261,39 @@ def generate_toolpath(
 
         color = fill if fill is not None and fill != "none" else stroke
         path_element = Path(element) if isinstance(element, Shape) else Path(element)
-        polygon = path_to_shapely(path_element)
-        if polygon is None:
-            continue
-        drawable_elements += 1
 
-        polygon = affinity.translate(polygon, xoff=-source_center[0], yoff=-source_center[1])
-        polygon = affinity.scale(polygon, xfact=scale, yfact=scale, origin=(0.0, 0.0))
-        polygon = affinity.rotate(polygon, rotation, origin=(0.0, 0.0), use_radians=False)
-        polygon = affinity.translate(polygon, xoff=destination[0], yoff=destination[1])
-
-        safe_polygon = polygon.intersection(machine_bed)
-        if safe_polygon.is_empty:
-            continue
-
-        density_fudge = float(params.get("densityFudge", 0.0))
-        density_scale = 1.0 - (density_fudge * 0.8)
-        spacing = max(
-            float(params.get("penThickness", 0.5)),
-            (0.5 + (get_luminance(color) * 4.5)) * density_scale,
-        )
-        hatch_grid = create_hatch_lines(safe_polygon.bounds, spacing)
-        # Intersect the complete grid in one GEOS operation. The original code
-        # intersected every line independently, which was the primary timeout hot path.
-        clipped_grid = safe_polygon.intersection(hatch_grid)
+        if generation_mode == "outline":
+            target_step_mm = max(0.05, float(params.get("penThickness", 0.5)) * 0.35)
+            source_step = target_step_mm / max(abs(scale), 1e-9)
+            source_geometries: list[Any] = path_to_centerlines(path_element, source_step)
+            if not source_geometries:
+                continue
+            drawable_elements += 1
+            transformed_lines: list[LineString] = []
+            for source_geometry in source_geometries:
+                transformed = _transform_svg_geometry(source_geometry, source_center, scale, rotation, destination)
+                clipped = transformed.intersection(machine_bed)
+                transformed_lines.extend(_iter_lines(clipped))
+            clipped_grid: Any = MultiLineString(transformed_lines) if transformed_lines else MultiLineString([])
+        else:
+            polygon = path_to_shapely(path_element)
+            if polygon is None:
+                continue
+            drawable_elements += 1
+            polygon = _transform_svg_geometry(polygon, source_center, scale, rotation, destination)
+            safe_polygon = polygon.intersection(machine_bed)
+            if safe_polygon.is_empty:
+                continue
+            density_fudge = float(params.get("densityFudge", 0.0))
+            density_scale = 1.0 - (density_fudge * 0.8)
+            spacing = max(
+                float(params.get("penThickness", 0.5)),
+                (0.5 + (get_luminance(color) * 4.5)) * density_scale,
+            )
+            hatch_grid = create_hatch_lines(safe_polygon.bounds, spacing)
+            # Intersect the complete grid in one GEOS operation. The original code
+            # intersected every line independently, which was the primary timeout hot path.
+            clipped_grid = safe_polygon.intersection(hatch_grid)
 
         for line in _iter_lines(clipped_grid):
             coordinates = [[round(float(x), 4), round(float(y), 4)] for x, y in line.coords]
@@ -1192,7 +1307,7 @@ def generate_toolpath(
             toolpath_points += len(coordinates)
             if len(compiled_paths) > MAX_HATCH_PATHS:
                 raise GenerationLimitError(
-                    f"The SVG generated more than {MAX_HATCH_PATHS:,} hatch paths. "
+                    f"The SVG generated more than {MAX_HATCH_PATHS:,} toolpaths. "
                     "Reduce the SVG complexity or scale before trying again."
                 )
             if toolpath_points > MAX_TOOLPATH_POINTS:
@@ -1213,7 +1328,7 @@ def generate_toolpath(
     )
 
     if drawable_elements == 0:
-        raise GenerationError("No filled or stroked SVG paths could be converted.")
+        raise GenerationError("No SVG outlines could be traced." if generation_mode == "outline" else "No filled or stroked SVG paths could be converted.")
 
     _set_progress(
         progress,
@@ -1221,33 +1336,44 @@ def generate_toolpath(
         percent=94.0,
         completed=0,
         total=len(compiled_paths),
-        detail="Compiling vector paths into G-code...",
+        detail=f"Compiling {generation_mode} paths into G-code...",
         compute_backend="geos-cpu",
     )
     _check_cancel_requested(progress)
     gcode = _compile_gcode(compiled_paths, params)
 
     duration = time.perf_counter() - started
+    stats: dict[str, Any] = {
+        "duration_seconds": round(duration, 3),
+        "drawable_elements": drawable_elements,
+        "hatch_paths": len(compiled_paths) if generation_mode == "hatch" else 0,
+        "outline_paths": len(compiled_paths) if generation_mode == "outline" else 0,
+        "continuous_paths": len(compiled_paths),
+        "generation_mode": generation_mode,
+        "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
+        "toolpath_points": toolpath_points,
+        "gcode_lines": len(gcode),
+        "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
+        "scale_mode": scale_mode,
+        "scale_percent": float(params["svgScale"]),
+        "source_width": round(source_width_mm if generation_mode == "outline" and source_width_mm > 0.0 else svg_width, 4),
+        "source_height": round(source_height_mm if generation_mode == "outline" and source_height_mm > 0.0 else svg_height, 4),
+        "compute_backend": "geos-cpu",
+        "gpu_accelerated": False,
+        "live_preview_points": preview_state["points"],
+    }
+    if generation_mode == "hatch":
+        stats.update({
+            "density_fudge": float(params.get("densityFudge", 0.0)),
+            "brightness_cutoff": float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF)),
+        })
+    else:
+        stats["outline_sampling_mm"] = max(0.05, float(params.get("penThickness", 0.5)) * 0.35)
+
     result = {
         "gcode": "\n".join(gcode),
         "paths": compiled_paths,
-        "stats": {
-            "duration_seconds": round(duration, 3),
-            "drawable_elements": drawable_elements,
-            "hatch_paths": len(compiled_paths),
-            "toolpath_points": toolpath_points,
-            "gcode_lines": len(gcode),
-            "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
-            "scale_mode": scale_mode,
-            "scale_percent": float(params["svgScale"]),
-            "source_width": round(svg_width, 4),
-            "source_height": round(svg_height, 4),
-            "compute_backend": "geos-cpu",
-            "gpu_accelerated": False,
-            "density_fudge": float(params.get("densityFudge", 0.0)),
-            "brightness_cutoff": float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF)),
-            "live_preview_points": preview_state["points"],
-        },
+        "stats": stats,
     }
     _set_progress(
         progress,
@@ -1408,6 +1534,8 @@ def _params_from_form(
     svgRotate: float,
     svgPosX: float,
     svgPosY: float,
+    sourceWidthMm: float,
+    sourceHeightMm: float,
     zMode: str,
     zUp: str,
     zDown: str,
@@ -1416,6 +1544,8 @@ def _params_from_form(
     penThickness: float,
     densityFudge: float,
     brightnessCutoff: float,
+    generationMode: str,
+    workspaceOrigin: str,
     patternLayout: str,
     waveform: str,
     patternCenterX: float,
@@ -1435,6 +1565,8 @@ def _params_from_form(
         "svgRotate": svgRotate,
         "svgPosX": svgPosX,
         "svgPosY": svgPosY,
+        "sourceWidthMm": sourceWidthMm,
+        "sourceHeightMm": sourceHeightMm,
         "zMode": zMode,
         "zUp": zUp,
         "zDown": zDown,
@@ -1443,6 +1575,8 @@ def _params_from_form(
         "penThickness": penThickness,
         "densityFudge": densityFudge,
         "brightnessCutoff": brightnessCutoff,
+        "generationMode": generationMode,
+        "workspaceOrigin": workspaceOrigin,
         "patternLayout": patternLayout,
         "waveform": waveform,
         "patternCenterX": patternCenterX,
@@ -1510,6 +1644,8 @@ async def create_generation_job(
     svgRotate: float = Form(0.0),
     svgPosX: float = Form(105.0),
     svgPosY: float = Form(148.5),
+    sourceWidthMm: float = Form(0.0),
+    sourceHeightMm: float = Form(0.0),
     zMode: str = Form("stepper"),
     zUp: str = Form("5.0"),
     zDown: str = Form("0.0"),
@@ -1518,6 +1654,8 @@ async def create_generation_job(
     penThickness: float = Form(0.5),
     densityFudge: float = Form(0.0),
     brightnessCutoff: float = Form(DEFAULT_BRIGHTNESS_CUTOFF),
+    generationMode: str = Form("hatch"),
+    workspaceOrigin: str = Form("top-left"),
     patternLayout: str = Form("linear"),
     waveform: str = Form("zigzag"),
     patternCenterX: float = Form(105.0),
@@ -1544,6 +1682,8 @@ async def create_generation_job(
         svgRotate,
         svgPosX,
         svgPosY,
+        sourceWidthMm,
+        sourceHeightMm,
         zMode,
         zUp,
         zDown,
@@ -1552,6 +1692,8 @@ async def create_generation_job(
         penThickness,
         densityFudge,
         brightnessCutoff,
+        generationMode,
+        workspaceOrigin,
         patternLayout,
         waveform,
         patternCenterX,
@@ -1707,6 +1849,8 @@ async def generate_gcode_compatibility(
     svgRotate: float = Form(0.0),
     svgPosX: float = Form(105.0),
     svgPosY: float = Form(148.5),
+    sourceWidthMm: float = Form(0.0),
+    sourceHeightMm: float = Form(0.0),
     zMode: str = Form("stepper"),
     zUp: str = Form("5.0"),
     zDown: str = Form("0.0"),
@@ -1715,6 +1859,8 @@ async def generate_gcode_compatibility(
     penThickness: float = Form(0.5),
     densityFudge: float = Form(0.0),
     brightnessCutoff: float = Form(DEFAULT_BRIGHTNESS_CUTOFF),
+    generationMode: str = Form("hatch"),
+    workspaceOrigin: str = Form("top-left"),
     patternLayout: str = Form("linear"),
     waveform: str = Form("zigzag"),
     patternCenterX: float = Form(105.0),
@@ -1738,6 +1884,8 @@ async def generate_gcode_compatibility(
         svgRotate,
         svgPosX,
         svgPosY,
+        sourceWidthMm,
+        sourceHeightMm,
         zMode,
         zUp,
         zDown,
@@ -1746,6 +1894,8 @@ async def generate_gcode_compatibility(
         penThickness,
         densityFudge,
         brightnessCutoff,
+        generationMode,
+        workspaceOrigin,
         patternLayout,
         waveform,
         patternCenterX,

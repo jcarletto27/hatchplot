@@ -33,6 +33,7 @@ let pickingPatternCenter = false;
 let brightnessCutoffOverlay = null;
 let brightnessCutoffPreviewToken = 0;
 let brightnessCutoffPreviewTimer = null;
+let lastWorkspaceOrigin = 'top-left';
 
 const MACHINE_SETTINGS_KEY = 'hatchPlotter.machineSettings.v1';
 const UI_SETTINGS_KEY = 'hatchPlotter.uiSettings.v1';
@@ -44,6 +45,7 @@ const COLLAPSIBLE_SECTION_IDS = ['machineSection', 'importSection', 'generateSec
 const MACHINE_SETTING_IDS = [
     'bedX',
     'bedY',
+    'workspaceOrigin',
     'zMode',
     'zUp',
     'zDown',
@@ -52,6 +54,7 @@ const MACHINE_SETTING_IDS = [
     'penThickness',
     'densityFudge',
     'brightnessCutoff',
+    'generationMode',
     'patternLayout',
     'waveform',
     'patternCenterX',
@@ -66,6 +69,7 @@ const MACHINE_SETTING_IDS = [
 const GENERATION_FIELD_TOOLTIPS = {
     bedX: 'Maximum drawable X extent in millimeters. Geometry outside X=0 through this value is clipped, and this value also determines workspace centering and fit calculations.',
     bedY: 'Maximum drawable Y extent in millimeters. Geometry outside Y=0 through this value is clipped, and this value also determines workspace centering and fit calculations.',
+    workspaceOrigin: 'Selects the machine-coordinate zero corner used in exported G-code. HatchPlot keeps the artwork in the same physical location when this setting changes.',
     zMode: 'Selects how HatchPlot emits pen-up and pen-down commands. Stepper mode uses Z moves; Servo/PWM mode emits spindle-style M3 S commands.',
     zUp: 'Pen-up value. In stepper mode this is the safe Z height; in Servo/PWM mode it is the output value used to release or lift the pen.',
     zDown: 'Pen-down value. In stepper mode this is the drawing Z height; in Servo/PWM mode it is the output value used to press or lower the pen.',
@@ -78,6 +82,7 @@ const GENERATION_FIELD_TOOLTIPS = {
     penThickness: 'Physical pen-tip width. It sets the minimum useful carrier step-over and preview stroke width; an accurate value helps avoid redundant, muddy lines.',
     densityFudge: 'Biases sampled darkness before density gating. Positive values retain more carriers for a darker result; negative values suppress carriers for a lighter, cleaner result.',
     brightnessCutoff: 'Minimum adjusted darkness required to draw. Raising it removes more pale gray detail and noise; lowering it preserves fainter tones.',
+    generationMode: 'Brightness Hatch converts grayscale into density-modulated carriers. Outline Trace follows SVG strokes and filled-shape boundaries without brightness sampling.',
     patternLayout: 'Selects the base carrier geometry used to traverse the brightness map. Hover the help icon after choosing a layout for a description of that layout.',
     waveform: 'Selects the shape displaced around each base carrier. Hover the help icon after choosing a waveform for a description of that waveform.',
     patternSpacing: 'Nominal distance between adjacent layout carriers before brightness-based density gating. Smaller spacing captures more detail but creates more lines and G-code.',
@@ -91,6 +96,16 @@ const GENERATION_FIELD_TOOLTIPS = {
 };
 
 const SELECT_OPTION_TOOLTIPS = {
+    workspaceOrigin: {
+        'top-left': 'Zero is at the upper-left corner. X increases rightward and Y increases downward.',
+        'top-right': 'Zero is at the upper-right corner. X increases leftward and Y increases downward.',
+        'bottom-left': 'Zero is at the lower-left corner. X increases rightward and Y increases upward.',
+        'bottom-right': 'Zero is at the lower-right corner. X increases leftward and Y increases upward.'
+    },
+    generationMode: {
+        hatch: 'Creates brightness-driven hatching or waveform carriers. Darker regions retain more lines and lighter regions retain fewer.',
+        outline: 'Traces SVG stroke centerlines and boundaries of filled shapes. Pattern, waveform, and brightness controls are ignored.'
+    },
     patternLayout: {
         linear: 'Parallel carriers crossing the artwork. This is the most predictable general-purpose layout; Pattern Angle controls their orientation.',
         spiral: 'A continuously expanding path around the selected pattern center. Useful for organic flow and fewer disconnected rings.',
@@ -123,6 +138,69 @@ function readPositiveNumber(id, fallback) {
 
 function formatNumber(value, maximumFractionDigits = 2) {
     return Number(value.toFixed(maximumFractionDigits)).toString();
+}
+
+function getWorkspaceOrigin() {
+    return document.getElementById('workspaceOrigin')?.value || 'top-left';
+}
+
+function workspaceToCanvasPoint(x, y, origin = getWorkspaceOrigin()) {
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    return {
+        x: origin.endsWith('right') ? bedX - x : x,
+        y: origin.startsWith('bottom') ? bedY - y : y,
+    };
+}
+
+function canvasToWorkspacePoint(x, y, origin = getWorkspaceOrigin()) {
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    return {
+        x: origin.endsWith('right') ? bedX - x : x,
+        y: origin.startsWith('bottom') ? bedY - y : y,
+    };
+}
+
+function getSvgCanvasCenter() {
+    const x = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
+    const y = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+    return workspaceToCanvasPoint(x, y);
+}
+
+function getPatternCanvasCenter() {
+    const x = Number.parseFloat(document.getElementById('patternCenterX').value) || 0;
+    const y = Number.parseFloat(document.getElementById('patternCenterY').value) || 0;
+    return workspaceToCanvasPoint(x, y);
+}
+
+function workspaceOriginLabel(origin = getWorkspaceOrigin()) {
+    return ({
+        'top-left': 'top-left',
+        'top-right': 'top-right',
+        'bottom-left': 'bottom-left',
+        'bottom-right': 'bottom-right',
+    })[origin] || 'top-left';
+}
+
+function updateWorkspaceOriginUi() {
+    const badge = document.getElementById('workspaceOriginBadge');
+    if (badge) badge.textContent = `Origin: ${workspaceOriginLabel()}`;
+    updateSelectOptionTooltip('workspaceOrigin');
+}
+
+function preserveCoordinatesAcrossOriginChange(previousOrigin, nextOrigin) {
+    for (const [xId, yId] of [['svgPosX', 'svgPosY'], ['patternCenterX', 'patternCenterY']]) {
+        const xInput = document.getElementById(xId);
+        const yInput = document.getElementById(yId);
+        const x = Number.parseFloat(xInput.value);
+        const y = Number.parseFloat(yInput.value);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        const canvasPoint = workspaceToCanvasPoint(x, y, previousOrigin);
+        const nextPoint = canvasToWorkspacePoint(canvasPoint.x, canvasPoint.y, nextOrigin);
+        xInput.value = formatNumber(nextPoint.x, 3);
+        yInput.value = formatNumber(nextPoint.y, 3);
+    }
 }
 
 function parseSvgLengthToMm(rawValue) {
@@ -312,6 +390,22 @@ function serializeEnabledSvg() {
     return new XMLSerializer().serializeToString(clone);
 }
 
+function serializeSvgForGeneration(generationMode) {
+    const svgText = serializeEnabledSvg();
+    if (generationMode !== 'outline' || !sourceSvgSizeMm) return svgText;
+    try {
+        const documentNode = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+        const root = documentNode.documentElement;
+        if (!root || root.nodeName.toLowerCase() !== 'svg' || root.querySelector('parsererror')) return svgText;
+        root.setAttribute('width', `${formatNumber(sourceSvgSizeMm.width, 6)}mm`);
+        root.setAttribute('height', `${formatNumber(sourceSvgSizeMm.height, 6)}mm`);
+        return new XMLSerializer().serializeToString(documentNode);
+    } catch (error) {
+        console.warn('Unable to normalize SVG physical dimensions for outline tracing:', error);
+        return svgText;
+    }
+}
+
 function getEnabledLayerNames() {
     return layerEntries.filter(layer => layer.enabled).map(layer => layer.name);
 }
@@ -365,10 +459,10 @@ function ensurePenThickness() {
     if (Number.isFinite(thickness) && thickness >= 0.05 && thickness <= 10) return thickness;
 
     const response = window.prompt(
-        'Enter the physical pen-tip thickness in millimeters. This controls zig-zag density and G-code preview width:',
+        'Enter the physical pen-tip thickness in millimeters. This controls useful hatch spacing, outline sampling, and G-code preview width:',
         '0.5'
     );
-    if (response === null) throw new Error('Pen thickness is required to generate the brightness-driven toolpath.');
+    if (response === null) throw new Error('Pen thickness is required to generate the toolpath.');
     thickness = Number.parseFloat(response);
     if (!Number.isFinite(thickness) || thickness < 0.05 || thickness > 10) {
         throw new Error('Pen thickness must be between 0.05 and 10 mm.');
@@ -409,7 +503,7 @@ function restoreStoredSettings() {
             if (section && typeof sectionStates[id] === 'boolean') section.open = sectionStates[id];
         });
     } catch (error) {
-        console.warn('Unable to restore saved Hatch Plotter settings:', error);
+        console.warn('Unable to restore saved HatchPlot settings:', error);
     }
 }
 
@@ -427,7 +521,7 @@ function saveMachineSettings() {
             status.textContent = 'Changes are saved automatically.';
         }, 1800);
     } catch (error) {
-        console.warn('Unable to save Hatch Plotter machine settings:', error);
+        console.warn('Unable to save HatchPlot machine settings:', error);
         document.getElementById('machineSettingsStatus').textContent = 'Browser storage is unavailable; settings were not saved.';
     }
 }
@@ -447,7 +541,7 @@ function saveUiSettings() {
             sectionStates
         }));
     } catch (error) {
-        console.warn('Unable to save Hatch Plotter UI settings:', error);
+        console.warn('Unable to save HatchPlot UI settings:', error);
     }
 }
 
@@ -477,6 +571,10 @@ function scheduleBrightnessCutoffPreview(delay = 120) {
 }
 
 async function refreshBrightnessCutoffPreview() {
+    if (document.getElementById('generationMode').value !== 'hatch') {
+        clearBrightnessCutoffPreview('Brightness cutoff is not used in Outline Trace mode.');
+        return;
+    }
     const enabled = document.getElementById('showBrightnessCutoffPreview').checked;
     if (!enabled) {
         clearBrightnessCutoffPreview();
@@ -504,8 +602,7 @@ async function refreshBrightnessCutoffPreview() {
 
     const scale = (Number.parseFloat(document.getElementById('svgScale').value) || 100) / 100;
     const rotation = (Number.parseFloat(document.getElementById('svgRotate').value) || 0) * Math.PI / 180;
-    const posX = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
-    const posY = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+    const { x: posX, y: posY } = getSvgCanvasCenter();
     const sourceWidthPixels = sourceSvgSizeMm.width * pixelsPerMm;
     const sourceHeightPixels = sourceSvgSizeMm.height * pixelsPerMm;
 
@@ -617,8 +714,7 @@ function renderBestGuessAnalysisCanvas(maximumDimension = 1200) {
 
     const scale = (Number.parseFloat(document.getElementById('svgScale').value) || 100) / 100;
     const rotation = (Number.parseFloat(document.getElementById('svgRotate').value) || 0) * Math.PI / 180;
-    const posX = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
-    const posY = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+    const { x: posX, y: posY } = getSvgCanvasCenter();
     const sourceWidthPixels = sourceSvgSizeMm.width * pixelsPerMm;
     const sourceHeightPixels = sourceSvgSizeMm.height * pixelsPerMm;
 
@@ -847,8 +943,9 @@ async function applyBestGuessSettings() {
         document.getElementById('waveform').value = guess.waveform;
         document.getElementById('patternSpacing').value = formatNumber(guess.patternSpacing, 3);
         document.getElementById('patternAngle').value = formatNumber(guess.patternAngle, 1);
-        document.getElementById('patternCenterX').value = formatNumber(guess.patternCenterX, 3);
-        document.getElementById('patternCenterY').value = formatNumber(guess.patternCenterY, 3);
+        const guessedCenter = canvasToWorkspacePoint(guess.patternCenterX, guess.patternCenterY);
+        document.getElementById('patternCenterX').value = formatNumber(guessedCenter.x, 3);
+        document.getElementById('patternCenterY').value = formatNumber(guessedCenter.y, 3);
         document.getElementById('patternClockwise').checked = true;
         document.getElementById('waveAmplitude').value = formatNumber(guess.waveAmplitude, 3);
         document.getElementById('waveLength').value = formatNumber(guess.waveLength, 3);
@@ -910,9 +1007,10 @@ function centerSvgInWorkspace(apply = true) {
 
 
 function updatePatternCenterMarker() {
-    const x = Number.parseFloat(document.getElementById('patternCenterX').value);
-    const y = Number.parseFloat(document.getElementById('patternCenterY').value);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const workspaceX = Number.parseFloat(document.getElementById('patternCenterX').value);
+    const workspaceY = Number.parseFloat(document.getElementById('patternCenterY').value);
+    if (!Number.isFinite(workspaceX) || !Number.isFinite(workspaceY)) return;
+    const { x, y } = workspaceToCanvasPoint(workspaceX, workspaceY);
     if (patternCenterMarker) patternCenterMarker.remove();
     patternCenterMarker = new paper.Group({ name: 'patternCenterMarker' });
     const radius = Math.max(2.5, readPositiveNumber('penThickness', 0.5) * 2);
@@ -942,6 +1040,7 @@ function updatePatternCenterMarker() {
         strokeColor: '#5f4300',
         strokeWidth: 0.5
     }));
+    patternCenterMarker.visible = document.getElementById('generationMode').value === 'hatch';
     patternCenterMarker.bringToFront();
 }
 
@@ -1012,7 +1111,7 @@ function installGenerationTooltips() {
             if (descriptions[option.value]) option.title = descriptions[option.value];
         });
 
-        if (['patternLayout', 'waveform'].includes(selectId)) {
+        if (['generationMode', 'patternLayout', 'waveform'].includes(selectId)) {
             let descriptionNode = document.getElementById(`${selectId}OptionDescription`);
             if (!descriptionNode) {
                 descriptionNode = document.createElement('div');
@@ -1023,6 +1122,25 @@ function installGenerationTooltips() {
         }
         updateSelectOptionTooltip(selectId);
     });
+}
+
+function updateGenerationModeVisibility() {
+    const mode = document.getElementById('generationMode').value;
+    const hatchControls = document.getElementById('hatchModeControls');
+    const outlineHelp = document.getElementById('outlineModeHelp');
+    const generateButton = document.getElementById('generateBtn');
+    const isOutline = mode === 'outline';
+    if (hatchControls) hatchControls.hidden = isOutline;
+    if (outlineHelp) outlineHelp.hidden = !isOutline;
+    if (generateButton) generateButton.textContent = isOutline ? 'Trace SVG Outlines' : 'Generate Toolpath';
+    if (patternCenterMarker) patternCenterMarker.visible = !isOutline;
+    if (isOutline) {
+        setPatternCenterPicking(false);
+        clearBrightnessCutoffPreview('Brightness cutoff is not used in Outline Trace mode.');
+    } else {
+        scheduleBrightnessCutoffPreview(0);
+    }
+    updateSelectOptionTooltip('generationMode');
 }
 
 function updatePatternControlVisibility() {
@@ -1070,12 +1188,15 @@ function initWorkspace(resetView = false) {
     });
 
     if (originMarker) originMarker.remove();
+    const origin = getWorkspaceOrigin();
+    const originPoint = workspaceToCanvasPoint(0, 0, origin);
     originMarker = new paper.Path.Circle({
-        center: [0, 0],
+        center: [originPoint.x, originPoint.y],
         radius: 4,
         fillColor: 'red',
         name: 'originMarker'
     });
+    updateWorkspaceOriginUi();
 
     const pad = 40;
     const scaleX = paper.view.viewSize.width / (bedX + pad);
@@ -1172,8 +1293,11 @@ function offerAutoScaleToFit(reason = 'upload') {
 }
 
 restoreStoredSettings();
+lastWorkspaceOrigin = getWorkspaceOrigin();
 installGenerationTooltips();
+updateGenerationModeVisibility();
 updatePatternControlVisibility();
+updateWorkspaceOriginUi();
 if (document.getElementById('autoCenter').checked) setCenterInputs();
 initWorkspace(true);
 
@@ -1204,7 +1328,26 @@ if (canvasShell && typeof ResizeObserver !== 'undefined') {
     input.addEventListener('change', () => offerAutoScaleToFit('machine-limit-change'));
 });
 
-MACHINE_SETTING_IDS.filter(id => !['bedX', 'bedY'].includes(id)).forEach(id => {
+document.getElementById('workspaceOrigin').addEventListener('change', event => {
+    const nextOrigin = event.target.value;
+    preserveCoordinatesAcrossOriginChange(lastWorkspaceOrigin, nextOrigin);
+    lastWorkspaceOrigin = nextOrigin;
+    saveMachineSettings();
+    initWorkspace(false);
+    applyTransforms();
+    updatePatternCenterMarker();
+    document.getElementById('generationStatus').textContent = `Workspace origin changed to ${workspaceOriginLabel(nextOrigin)}; artwork placement was preserved.`;
+});
+
+document.getElementById('generationMode').addEventListener('change', () => {
+    saveMachineSettings();
+    updateGenerationModeVisibility();
+    document.getElementById('generationStatus').textContent = document.getElementById('generationMode').value === 'outline'
+        ? 'Outline Trace mode selected. SVG strokes and filled-shape boundaries will be followed directly.'
+        : 'Brightness Hatch mode selected. Tone controls local line density.';
+});
+
+MACHINE_SETTING_IDS.filter(id => !['bedX', 'bedY', 'workspaceOrigin', 'generationMode'].includes(id)).forEach(id => {
     const input = document.getElementById(id);
     input.addEventListener('input', saveMachineSettings);
     input.addEventListener('change', saveMachineSettings);
@@ -1239,7 +1382,7 @@ document.getElementById('bestGuessBtn').addEventListener('click', applyBestGuess
 ['patternLayout', 'waveform'].forEach(id => {
     document.getElementById(id).addEventListener('change', updatePatternControlVisibility);
 });
-['brightnessModulation', 'zMode'].forEach(id => {
+['brightnessModulation', 'zMode', 'workspaceOrigin', 'generationMode'].forEach(id => {
     document.getElementById(id).addEventListener('change', () => updateSelectOptionTooltip(id));
 });
 document.getElementById('centerPatternBtn').addEventListener('click', setPatternCenterToWorkspace);
@@ -1283,14 +1426,15 @@ document.getElementById('canvas').addEventListener('pointerdown', event => {
     const projectPoint = paper.view.viewToProject(viewPoint);
     const bedX = readPositiveNumber('bedX', 210);
     const bedY = readPositiveNumber('bedY', 297);
-    const x = Math.max(0, Math.min(bedX, projectPoint.x));
-    const y = Math.max(0, Math.min(bedY, projectPoint.y));
-    document.getElementById('patternCenterX').value = formatNumber(x, 3);
-    document.getElementById('patternCenterY').value = formatNumber(y, 3);
+    const canvasX = Math.max(0, Math.min(bedX, projectPoint.x));
+    const canvasY = Math.max(0, Math.min(bedY, projectPoint.y));
+    const workspacePoint = canvasToWorkspacePoint(canvasX, canvasY);
+    document.getElementById('patternCenterX').value = formatNumber(workspacePoint.x, 3);
+    document.getElementById('patternCenterY').value = formatNumber(workspacePoint.y, 3);
     saveMachineSettings();
     updatePatternCenterMarker();
     setPatternCenterPicking(false);
-    document.getElementById('generationStatus').textContent = `Pattern center pinned at X${formatNumber(x, 2)}, Y${formatNumber(y, 2)} mm.`;
+    document.getElementById('generationStatus').textContent = `Pattern center pinned at X${formatNumber(workspacePoint.x, 2)}, Y${formatNumber(workspacePoint.y, 2)} mm from the ${workspaceOriginLabel()} origin.`;
 });
 document.addEventListener('keydown', event => {
     if (event.key === 'Escape' && pickingPatternCenter) {
@@ -1381,8 +1525,7 @@ function applyTransforms() {
 
     const scalePercent = Number.parseFloat(document.getElementById('svgScale').value) || 100;
     const rotation = Number.parseFloat(document.getElementById('svgRotate').value) || 0;
-    const posX = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
-    const posY = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+    const { x: posX, y: posY } = getSvgCanvasCenter();
 
     // Scale is now the SVG's actual percentage: 100% preserves its imported size.
     // Auto-fit calculates and inserts the percentage required for the active bed.
@@ -1535,6 +1678,8 @@ function currentGcodeSettings() {
         enabledLayers: getEnabledLayerNames(),
         bedX: readPositiveNumber('bedX', 210),
         bedY: readPositiveNumber('bedY', 297),
+        workspaceOrigin: getWorkspaceOrigin(),
+        generationMode: document.getElementById('generationMode').value,
         zMode: document.getElementById('zMode').value,
         zUp: document.getElementById('zUp').value,
         zDown: document.getElementById('zDown').value,
@@ -1576,25 +1721,41 @@ function buildGcodeHeader(settings, pathCount = null) {
         : 'All visible layers';
     const direction = settings.patternClockwise ? 'clockwise' : 'counterclockwise';
     const toolpathCount = Number.isInteger(pathCount) ? String(pathCount) : 'live preview';
-    return [
+    const lines = [
         '; HatchPlot generated G-code',
         `; Source SVG: ${gcodeCommentValue(settings.sourceFilename)}`,
         `; Enabled layers: ${layers}`,
         `; Machine bed: ${gcodeFixed(settings.bedX)} x ${gcodeFixed(settings.bedY)} mm`,
+        `; Workspace origin: ${gcodeCommentValue(settings.workspaceOrigin)}`,
+        `; Generation mode: ${gcodeCommentValue(settings.generationMode)}`,
         `; Z control: ${gcodeCommentValue(settings.zMode)}; up=${gcodeCommentValue(settings.zUp)}; down=${gcodeCommentValue(settings.zDown)}; plunge=${settings.zPlungeRate} mm/min`,
         `; XY feed rate: ${settings.xyFeedRate} mm/min`,
         `; Pen size: ${gcodeFixed(settings.penThickness)} mm`,
         `; SVG transform: scale=${gcodeFixed(settings.svgScale)}% (${gcodeCommentValue(settings.svgScaleMode)}); rotation=${gcodeFixed(settings.svgRotate)} deg; center=(${gcodeFixed(settings.svgPosX)}, ${gcodeFixed(settings.svgPosY)}) mm`,
-        `; Brightness: cutoff=${gcodeFixed(settings.brightnessCutoff)}; density fudge=${Number(settings.densityFudge) >= 0 ? '+' : ''}${gcodeFixed(settings.densityFudge)}; modulation=${gcodeCommentValue(settings.brightnessModulation)}`,
-        `; Pattern: layout=${gcodeCommentValue(settings.patternLayout)}; spacing=${gcodeFixed(settings.patternSpacing)} mm; angle=${gcodeFixed(settings.patternAngle)} deg; center=(${gcodeFixed(settings.patternCenterX)}, ${gcodeFixed(settings.patternCenterY)}) mm; direction=${direction}`,
-        `; Waveform: type=${gcodeCommentValue(settings.waveform)}; amplitude=${gcodeFixed(settings.waveAmplitude)} mm; wavelength=${gcodeFixed(settings.waveLength)} mm`,
+    ];
+    if (settings.generationMode === 'outline') {
+        lines.push('; Outline: traces SVG stroke centerlines and boundaries of filled shapes');
+    } else {
+        lines.push(
+            `; Brightness: cutoff=${gcodeFixed(settings.brightnessCutoff)}; density fudge=${Number(settings.densityFudge) >= 0 ? '+' : ''}${gcodeFixed(settings.densityFudge)}; modulation=${gcodeCommentValue(settings.brightnessModulation)}`,
+            `; Pattern: layout=${gcodeCommentValue(settings.patternLayout)}; spacing=${gcodeFixed(settings.patternSpacing)} mm; angle=${gcodeFixed(settings.patternAngle)} deg; center=(${gcodeFixed(settings.patternCenterX)}, ${gcodeFixed(settings.patternCenterY)}) mm; direction=${direction}`,
+            `; Waveform: type=${gcodeCommentValue(settings.waveform)}; amplitude=${gcodeFixed(settings.waveAmplitude)} mm; wavelength=${gcodeFixed(settings.waveLength)} mm`
+        );
+    }
+    lines.push(
         `; Toolpaths: ${toolpathCount}`,
         '; End HatchPlot header',
         'G21',
         'G90',
         settings.zMode === 'stepper' ? `G0 Z${settings.zUp}` : `M3 S${settings.zUp}`
-    ];
+    );
+    return lines;
 }
+
+function canvasPointToGcode(point) {
+    return canvasToWorkspacePoint(Number(point[0]), Number(point[1]));
+}
+
 
 function appendGcodeForPaths(paths) {
     const settings = currentGcodeSettings();
@@ -1602,7 +1763,8 @@ function appendGcodeForPaths(paths) {
     for (const path of paths) {
         if (!Array.isArray(path) || path.length < 2) continue;
         const rapidLine = lines.length;
-        lines.push(`G0 X${Number(path[0][0]).toFixed(2)} Y${Number(path[0][1]).toFixed(2)}`);
+        const firstPoint = canvasPointToGcode(path[0]);
+        lines.push(`G0 X${firstPoint.x.toFixed(2)} Y${firstPoint.y.toFixed(2)}`);
         const penDownLine = lines.length;
         lines.push(settings.zMode === 'stepper'
             ? `G1 Z${settings.zDown} F${settings.zPlungeRate}`
@@ -1610,7 +1772,8 @@ function appendGcodeForPaths(paths) {
         const moveStartLine = lines.length;
         path.slice(1).forEach((point, pointIndex) => {
             const feed = pointIndex === 0 ? ` F${settings.xyFeedRate}` : '';
-            lines.push(`G1 X${Number(point[0]).toFixed(2)} Y${Number(point[1]).toFixed(2)}${feed}`);
+            const outputPoint = canvasPointToGcode(point);
+            lines.push(`G1 X${outputPoint.x.toFixed(2)} Y${outputPoint.y.toFixed(2)}${feed}`);
         });
         const penUpLine = lines.length;
         lines.push(settings.zMode === 'stepper' ? `G0 Z${settings.zUp}` : `M3 S${settings.zUp}`);
@@ -1684,8 +1847,7 @@ async function renderBrightnessMap(penThickness) {
 
     const scale = (Number.parseFloat(document.getElementById('svgScale').value) || 100) / 100;
     const rotation = (Number.parseFloat(document.getElementById('svgRotate').value) || 0) * Math.PI / 180;
-    const posX = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
-    const posY = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+    const { x: posX, y: posY } = getSvgCanvasCenter();
     const sourceWidthPixels = sourceSvgSizeMm.width * pixelsPerMm;
     const sourceHeightPixels = sourceSvgSizeMm.height * pixelsPerMm;
 
@@ -1711,33 +1873,48 @@ async function buildGenerationFormData(penThickness) {
     if (!enabledLayerNames.length) {
         throw new Error('Enable at least one SVG layer before generating a toolpath.');
     }
-    const densityFudge = Number.parseFloat(document.getElementById('densityFudge').value);
-    if (!Number.isFinite(densityFudge) || densityFudge < -0.5 || densityFudge > 0.5) {
-        throw new Error('Density fudge must be between -0.5 and 0.5.');
+    const generationMode = document.getElementById('generationMode').value;
+    let densityFudge = Number.parseFloat(document.getElementById('densityFudge').value);
+    let brightnessCutoff = Number.parseFloat(document.getElementById('brightnessCutoff').value);
+    let patternSpacing = Number.parseFloat(document.getElementById('patternSpacing').value);
+    let waveAmplitude = Number.parseFloat(document.getElementById('waveAmplitude').value);
+    let waveLength = Number.parseFloat(document.getElementById('waveLength').value);
+    if (generationMode === 'hatch') {
+        if (!Number.isFinite(densityFudge) || densityFudge < -0.5 || densityFudge > 0.5) {
+            throw new Error('Density fudge must be between -0.5 and 0.5.');
+        }
+        if (!Number.isFinite(brightnessCutoff) || brightnessCutoff < 0 || brightnessCutoff > 1) {
+            throw new Error('Brightness cutoff must be between 0 and 1.');
+        }
+        if (!Number.isFinite(patternSpacing) || patternSpacing < 0.05) throw new Error('Layout spacing must be at least 0.05 mm.');
+        if (!Number.isFinite(waveAmplitude) || waveAmplitude < 0) throw new Error('Wave amplitude cannot be negative.');
+        if (!Number.isFinite(waveLength) || waveLength < 0.05) throw new Error('Wavelength must be at least 0.05 mm.');
+    } else {
+        densityFudge = Number.isFinite(densityFudge) ? densityFudge : 0;
+        brightnessCutoff = Number.isFinite(brightnessCutoff) ? brightnessCutoff : 0;
+        patternSpacing = Number.isFinite(patternSpacing) && patternSpacing >= 0.05 ? patternSpacing : 1;
+        waveAmplitude = Number.isFinite(waveAmplitude) && waveAmplitude >= 0 ? waveAmplitude : 0;
+        waveLength = Number.isFinite(waveLength) && waveLength >= 0.05 ? waveLength : 3;
     }
-    const brightnessCutoff = Number.parseFloat(document.getElementById('brightnessCutoff').value);
-    if (!Number.isFinite(brightnessCutoff) || brightnessCutoff < 0 || brightnessCutoff > 1) {
-        throw new Error('Brightness cutoff must be between 0 and 1.');
-    }
-    const patternSpacing = Number.parseFloat(document.getElementById('patternSpacing').value);
-    const waveAmplitude = Number.parseFloat(document.getElementById('waveAmplitude').value);
-    const waveLength = Number.parseFloat(document.getElementById('waveLength').value);
-    if (!Number.isFinite(patternSpacing) || patternSpacing < 0.05) throw new Error('Layout spacing must be at least 0.05 mm.');
-    if (!Number.isFinite(waveAmplitude) || waveAmplitude < 0) throw new Error('Wave amplitude cannot be negative.');
-    if (!Number.isFinite(waveLength) || waveLength < 0.05) throw new Error('Wavelength must be at least 0.05 mm.');
 
-    const brightnessMap = await renderBrightnessMap(penThickness);
+    const brightnessMap = generationMode === 'hatch' ? await renderBrightnessMap(penThickness) : null;
+    const svgCenter = getSvgCanvasCenter();
+    const patternCenter = getPatternCanvasCenter();
     const formData = new FormData();
-    const filteredSvg = new Blob([serializeEnabledSvg()], { type: 'image/svg+xml' });
+    const filteredSvg = new Blob([serializeSvgForGeneration(generationMode)], { type: 'image/svg+xml' });
     formData.append('file', filteredSvg, fileInput.files[0]?.name || 'filtered.svg');
-    formData.append('brightnessMap', brightnessMap, 'brightness-map.png');
+    if (brightnessMap) formData.append('brightnessMap', brightnessMap, 'brightness-map.png');
     formData.append('bedX', document.getElementById('bedX').value);
     formData.append('bedY', document.getElementById('bedY').value);
+    formData.append('workspaceOrigin', getWorkspaceOrigin());
+    formData.append('generationMode', generationMode);
     formData.append('svgScale', document.getElementById('svgScale').value);
     formData.append('svgScaleMode', 'absolute');
     formData.append('svgRotate', document.getElementById('svgRotate').value);
-    formData.append('svgPosX', document.getElementById('svgPosX').value);
-    formData.append('svgPosY', document.getElementById('svgPosY').value);
+    formData.append('svgPosX', formatNumber(svgCenter.x, 4));
+    formData.append('svgPosY', formatNumber(svgCenter.y, 4));
+    formData.append('sourceWidthMm', formatNumber(sourceSvgSizeMm?.width || 0, 4));
+    formData.append('sourceHeightMm', formatNumber(sourceSvgSizeMm?.height || 0, 4));
     formData.append('zMode', document.getElementById('zMode').value);
     formData.append('zUp', document.getElementById('zUp').value);
     formData.append('zDown', document.getElementById('zDown').value);
@@ -1748,8 +1925,8 @@ async function buildGenerationFormData(penThickness) {
     formData.append('brightnessCutoff', formatNumber(brightnessCutoff, 3));
     formData.append('patternLayout', document.getElementById('patternLayout').value);
     formData.append('waveform', document.getElementById('waveform').value);
-    formData.append('patternCenterX', document.getElementById('patternCenterX').value);
-    formData.append('patternCenterY', document.getElementById('patternCenterY').value);
+    formData.append('patternCenterX', formatNumber(patternCenter.x, 4));
+    formData.append('patternCenterY', formatNumber(patternCenter.y, 4));
     formData.append('patternAngle', document.getElementById('patternAngle').value);
     formData.append('patternSpacing', formatNumber(patternSpacing, 4));
     formData.append('patternClockwise', document.getElementById('patternClockwise').checked ? 'true' : 'false');
@@ -1854,7 +2031,9 @@ function displayGeneratedResult(data) {
 
     const stats = data.stats || {};
     generationStatus.textContent = [
-        `${Number(stats.continuous_paths || stats.hatch_paths || data.paths.length).toLocaleString()} continuous paths`,
+        `${Number(stats.continuous_paths || stats.outline_paths || stats.hatch_paths || data.paths.length).toLocaleString()} continuous paths`,
+        stats.generation_mode ? `${stats.generation_mode} mode` : null,
+        stats.workspace_origin ? `${stats.workspace_origin} origin` : null,
         stats.scanlines ? `${Number(stats.scanlines).toLocaleString()} brightness scanlines` : null,
         stats.pen_thickness_mm ? `${formatNumber(Number(stats.pen_thickness_mm), 3)} mm pen` : null,
         stats.density_fudge !== undefined ? `${Number(stats.density_fudge) >= 0 ? '+' : ''}${formatNumber(Number(stats.density_fudge), 2)} density fudge` : null,
@@ -1862,6 +2041,7 @@ function displayGeneratedResult(data) {
         stats.pattern_layout ? `${stats.pattern_layout} layout` : null,
         stats.waveform ? `${stats.waveform} waveform` : null,
         stats.pattern_spacing_mm ? `${formatNumber(Number(stats.pattern_spacing_mm), 3)} mm layout spacing` : null,
+        stats.outline_sampling_mm ? `${formatNumber(Number(stats.outline_sampling_mm), 3)} mm outline sampling` : null,
         stats.gcode_lines ? `${Number(stats.gcode_lines).toLocaleString()} G-code lines` : null,
         stats.row_pitch_mm ? `${formatNumber(Number(stats.row_pitch_mm), 3)} mm row pitch` : null,
         stats.sample_step_mm ? `${formatNumber(Number(stats.sample_step_mm), 3)} mm sample step` : null,
@@ -1885,9 +2065,18 @@ generateButton.addEventListener('click', async function() {
 
     try {
         const penThickness = ensurePenThickness();
-        setLoading('Rendering a brightness map from the transformed SVG...', 1, 'Preparing the exact machine-coordinate raster');
+        const generationMode = document.getElementById('generationMode').value;
+        setLoading(
+            generationMode === 'outline' ? 'Preparing SVG outlines...' : 'Rendering a brightness map from the transformed SVG...',
+            1,
+            generationMode === 'outline' ? 'Sampling vector strokes and filled-shape boundaries' : 'Preparing the exact machine-coordinate raster'
+        );
         const formData = await buildGenerationFormData(penThickness);
-        setLoading('Uploading SVG and starting zig-zag generation...', 2, 'Starting the queued backend job');
+        setLoading(
+            generationMode === 'outline' ? 'Uploading SVG and starting outline tracing...' : 'Uploading SVG and starting brightness-driven generation...',
+            2,
+            'Starting the queued backend job'
+        );
         const createResponse = await fetch('/api/jobs', {
             method: 'POST',
             body: formData,
