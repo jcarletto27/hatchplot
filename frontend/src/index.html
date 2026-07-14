@@ -126,6 +126,33 @@
             font-size: 0.76rem;
             font-weight: 650;
         }
+        .field-tooltip {
+            display: inline-grid;
+            place-items: center;
+            width: 16px;
+            height: 16px;
+            margin-left: 5px;
+            color: var(--accent);
+            background: rgba(85, 214, 190, 0.10);
+            border: 1px solid rgba(85, 214, 190, 0.30);
+            border-radius: 50%;
+            cursor: help;
+            font-size: 0.66rem;
+            font-weight: 850;
+            line-height: 1;
+            vertical-align: 1px;
+        }
+        .field-tooltip:focus {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+        .option-description {
+            min-height: 2.7em;
+            margin-top: 6px;
+            color: var(--muted);
+            font-size: 0.69rem;
+            line-height: 1.35;
+        }
         input, select {
             width: 100%;
             min-height: 39px;

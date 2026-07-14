@@ -63,6 +63,59 @@ const MACHINE_SETTING_IDS = [
     'brightnessModulation'
 ];
 
+const GENERATION_FIELD_TOOLTIPS = {
+    bedX: 'Maximum drawable X extent in millimeters. Geometry outside X=0 through this value is clipped, and this value also determines workspace centering and fit calculations.',
+    bedY: 'Maximum drawable Y extent in millimeters. Geometry outside Y=0 through this value is clipped, and this value also determines workspace centering and fit calculations.',
+    zMode: 'Selects how HatchPlot emits pen-up and pen-down commands. Stepper mode uses Z moves; Servo/PWM mode emits spindle-style M3 S commands.',
+    zUp: 'Pen-up value. In stepper mode this is the safe Z height; in Servo/PWM mode it is the output value used to release or lift the pen.',
+    zDown: 'Pen-down value. In stepper mode this is the drawing Z height; in Servo/PWM mode it is the output value used to press or lower the pen.',
+    xyFeedRate: 'Drawing and travel speed for XY moves in millimeters per minute. This changes execution speed, not hatch geometry.',
+    zPlungeRate: 'Pen-lift and pen-lower speed in millimeters per minute when using stepper Z mode.',
+    svgScale: 'Uniformly scales the source artwork before brightness sampling. Larger values expose more source detail but may exceed the machine bounds.',
+    svgRotate: 'Rotates the source artwork around its center before brightness sampling and toolpath generation.',
+    svgPosX: 'Machine-space X coordinate of the transformed SVG center. Moving it changes which pixels are sampled at each toolpath point.',
+    svgPosY: 'Machine-space Y coordinate of the transformed SVG center. Moving it changes which pixels are sampled at each toolpath point.',
+    penThickness: 'Physical pen-tip width. It sets the minimum useful carrier step-over and preview stroke width; an accurate value helps avoid redundant, muddy lines.',
+    densityFudge: 'Biases sampled darkness before density gating. Positive values retain more carriers for a darker result; negative values suppress carriers for a lighter, cleaner result.',
+    brightnessCutoff: 'Minimum adjusted darkness required to draw. Raising it removes more pale gray detail and noise; lowering it preserves fainter tones.',
+    patternLayout: 'Selects the base carrier geometry used to traverse the brightness map. Hover the help icon after choosing a layout for a description of that layout.',
+    waveform: 'Selects the shape displaced around each base carrier. Hover the help icon after choosing a waveform for a description of that waveform.',
+    patternSpacing: 'Nominal distance between adjacent layout carriers before brightness-based density gating. Smaller spacing captures more detail but creates more lines and G-code.',
+    patternAngle: 'Rotates linear carriers or the radial starting direction. Use it to align hatching with important edges or reduce directional artifacts.',
+    patternCenterX: 'Machine-space X coordinate used as the origin for spiral, concentric, and radial layouts.',
+    patternCenterY: 'Machine-space Y coordinate used as the origin for spiral, concentric, and radial layouts.',
+    patternClockwise: 'Controls traversal direction for spiral, concentric, and radial layouts. It changes plotting order and waveform direction, not the sampled brightness.',
+    waveAmplitude: 'Maximum lateral displacement from the base carrier. Larger values create stronger texture but can blur or cross fine features.',
+    waveLength: 'Base distance for one waveform cycle. Shorter wavelengths capture finer tonal variation but increase point count and can emphasize noise.',
+    brightnessModulation: 'Chooses whether darkness changes waveform amplitude, waveform frequency, both, or neither. Local line density always remains brightness-driven.'
+};
+
+const SELECT_OPTION_TOOLTIPS = {
+    patternLayout: {
+        linear: 'Parallel carriers crossing the artwork. This is the most predictable general-purpose layout; Pattern Angle controls their orientation.',
+        spiral: 'A continuously expanding path around the selected pattern center. Useful for organic flow and fewer disconnected rings.',
+        concentric: 'Nested closed rings around the selected pattern center. Good for emphasizing radial shading and centered subjects.',
+        radial: 'Spokes extending around the selected pattern center. Useful for starburst or center-focused imagery; Pattern Angle rotates the first spoke.'
+    },
+    waveform: {
+        zigzag: 'A triangular oscillation with sharp, alternating turns. Produces strong tonal texture and efficient straight segments.',
+        sawtooth: 'A directional ramp followed by a rapid reset. Produces a visibly directional, engraved texture.',
+        sine: 'A smooth sinusoidal oscillation. Produces fluid lines with fewer abrupt direction changes and generally less mechanical chatter.',
+        ekg: 'A mostly restrained line with periodic sharp pulse-like deviations. Best used as a stylized texture rather than neutral photographic shading.',
+        straight: 'No transverse waveform displacement. Brightness is represented only by retaining or removing layout carriers.'
+    },
+    brightnessModulation: {
+        both: 'Darkness changes both waveform displacement and cycle frequency in addition to carrier density. This gives the strongest tonal response.',
+        amplitude: 'Darkness changes waveform displacement only. Frequency remains stable, which can preserve a cleaner rhythm.',
+        frequency: 'Darkness changes cycle frequency only. Amplitude remains stable while darker areas receive tighter oscillations.',
+        none: 'Disables waveform modulation. Brightness affects only carrier density, producing the cleanest and most predictable geometry.'
+    },
+    zMode: {
+        stepper: 'Emits conventional G0/G1 Z moves for a motorized pen-lift axis.',
+        servo: 'Emits M3 S-style values for a servo, PWM pen lift, or compatible controller output.'
+    }
+};
+
 function readPositiveNumber(id, fallback) {
     const value = Number.parseFloat(document.getElementById(id).value);
     return Number.isFinite(value) && value > 0 ? value : fallback;
@@ -916,12 +969,70 @@ function setPatternCenterToWorkspace() {
     document.getElementById('generationStatus').textContent = 'Pattern center set to the workspace center.';
 }
 
+function updateSelectOptionTooltip(selectId) {
+    const select = document.getElementById(selectId);
+    const descriptions = SELECT_OPTION_TOOLTIPS[selectId];
+    if (!select || !descriptions) return;
+
+    const description = descriptions[select.value] || GENERATION_FIELD_TOOLTIPS[selectId] || '';
+    select.title = description;
+    const icon = document.querySelector(`.field-tooltip[data-for="${selectId}"]`);
+    if (icon) {
+        icon.title = description;
+        icon.setAttribute('aria-label', `Help: ${description}`);
+    }
+    const descriptionNode = document.getElementById(`${selectId}OptionDescription`);
+    if (descriptionNode) descriptionNode.textContent = description;
+}
+
+function installGenerationTooltips() {
+    Object.entries(GENERATION_FIELD_TOOLTIPS).forEach(([fieldId, description]) => {
+        const control = document.getElementById(fieldId);
+        const label = document.querySelector(`label[for="${fieldId}"]`);
+        if (!control || !label) return;
+
+        control.title = description;
+        if (!label.querySelector(`.field-tooltip[data-for="${fieldId}"]`)) {
+            const icon = document.createElement('span');
+            icon.className = 'field-tooltip';
+            icon.dataset.for = fieldId;
+            icon.tabIndex = 0;
+            icon.textContent = '?';
+            icon.title = description;
+            icon.setAttribute('role', 'img');
+            icon.setAttribute('aria-label', `Help: ${description}`);
+            label.appendChild(icon);
+        }
+    });
+
+    Object.entries(SELECT_OPTION_TOOLTIPS).forEach(([selectId, descriptions]) => {
+        const select = document.getElementById(selectId);
+        if (!select) return;
+        Array.from(select.options).forEach(option => {
+            if (descriptions[option.value]) option.title = descriptions[option.value];
+        });
+
+        if (['patternLayout', 'waveform'].includes(selectId)) {
+            let descriptionNode = document.getElementById(`${selectId}OptionDescription`);
+            if (!descriptionNode) {
+                descriptionNode = document.createElement('div');
+                descriptionNode.id = `${selectId}OptionDescription`;
+                descriptionNode.className = 'option-description';
+                select.insertAdjacentElement('afterend', descriptionNode);
+            }
+        }
+        updateSelectOptionTooltip(selectId);
+    });
+}
+
 function updatePatternControlVisibility() {
     const layout = document.getElementById('patternLayout').value;
     const waveform = document.getElementById('waveform').value;
     document.getElementById('patternAngleGroup').style.display = ['linear', 'radial'].includes(layout) ? '' : 'none';
     document.getElementById('patternDirectionGroup').style.display = ['spiral', 'concentric', 'radial'].includes(layout) ? 'flex' : 'none';
     document.getElementById('waveformControls').style.display = waveform === 'straight' ? 'none' : 'flex';
+    updateSelectOptionTooltip('patternLayout');
+    updateSelectOptionTooltip('waveform');
 }
 
 // --- WORKSPACE INITIALIZATION ---
@@ -1061,6 +1172,8 @@ function offerAutoScaleToFit(reason = 'upload') {
 }
 
 restoreStoredSettings();
+installGenerationTooltips();
+updatePatternControlVisibility();
 if (document.getElementById('autoCenter').checked) setCenterInputs();
 initWorkspace(true);
 
@@ -1123,6 +1236,12 @@ document.getElementById('showBrightnessCutoffPreview').addEventListener('change'
     scheduleBrightnessCutoffPreview(0);
 });
 document.getElementById('bestGuessBtn').addEventListener('click', applyBestGuessSettings);
+['patternLayout', 'waveform'].forEach(id => {
+    document.getElementById(id).addEventListener('change', updatePatternControlVisibility);
+});
+['brightnessModulation', 'zMode'].forEach(id => {
+    document.getElementById(id).addEventListener('change', () => updateSelectOptionTooltip(id));
+});
 document.getElementById('centerPatternBtn').addEventListener('click', setPatternCenterToWorkspace);
 document.getElementById('pickPatternCenterBtn').addEventListener('click', () => {
     setPatternCenterPicking(!pickingPatternCenter);
