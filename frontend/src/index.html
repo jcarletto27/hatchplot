@@ -328,6 +328,15 @@
             background: rgba(255, 42, 42, 0.72);
             box-shadow: 0 0 0 1px rgba(255, 120, 120, 0.5);
         }
+        .best-guess-panel {
+            margin-top: 12px;
+            padding: 10px;
+            border: 1px solid rgba(85, 214, 190, 0.18);
+            border-radius: 10px;
+            background: rgba(85, 214, 190, 0.05);
+        }
+        .best-guess-panel button { margin-top: 0; }
+        .best-guess-panel .status { margin-top: 8px; }
 
         .output-panel {
             flex: 0 0 auto;
@@ -547,6 +556,10 @@
                     <div id="brightnessCutoffPreviewStatus" class="cutoff-preview-status">Enable the preview to highlight excluded SVG pixels in red.</div>
                 </div>
                 <div class="helper-card">Brightness always controls local line density: darker areas retain more carriers, lighter areas retain fewer, and white areas are skipped. Pen size sets the minimum useful step-over. Positive fudge produces a denser, darker result.</div>
+                <div class="best-guess-panel">
+                    <button type="button" id="bestGuessBtn" class="secondary-btn">Best Guess: Optimize Detail</button>
+                    <div id="bestGuessStatus" class="status" aria-live="polite">Analyzes the transformed, enabled SVG layers and selects a conservative detail-first pattern while suppressing the lightest likely noise.</div>
+                </div>
 
                 <div class="subsection-title">Pattern</div>
                 <div class="flex-row">

@@ -529,6 +529,298 @@ async function refreshBrightnessCutoffPreview() {
     }
 }
 
+function clampBestGuessValue(value, minimum, maximum) {
+    return Math.max(minimum, Math.min(maximum, value));
+}
+
+function histogramPercentile(histogram, total, percentile) {
+    if (!total) return 0;
+    const target = clampBestGuessValue(percentile, 0, 1) * total;
+    let cumulative = 0;
+    for (let index = 0; index < histogram.length; index += 1) {
+        cumulative += histogram[index];
+        if (cumulative >= target) return index / (histogram.length - 1);
+    }
+    return 1;
+}
+
+function renderBestGuessAnalysisCanvas(maximumDimension = 1200) {
+    if (!originalSVGImage || !sourceSvgSizeMm) {
+        throw new Error('Load an SVG before running Best Guess.');
+    }
+
+    const bedX = readPositiveNumber('bedX', 210);
+    const bedY = readPositiveNumber('bedY', 297);
+    const pixelsPerMm = Math.max(0.3, Math.min(4, maximumDimension / bedX, maximumDimension / bedY));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.ceil(bedX * pixelsPerMm));
+    canvas.height = Math.max(1, Math.ceil(bedY * pixelsPerMm));
+    const context = canvas.getContext('2d', { alpha: true, willReadFrequently: true });
+    if (!context) throw new Error('The browser could not create the Best Guess analysis canvas.');
+
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+
+    const scale = (Number.parseFloat(document.getElementById('svgScale').value) || 100) / 100;
+    const rotation = (Number.parseFloat(document.getElementById('svgRotate').value) || 0) * Math.PI / 180;
+    const posX = Number.parseFloat(document.getElementById('svgPosX').value) || 0;
+    const posY = Number.parseFloat(document.getElementById('svgPosY').value) || 0;
+    const sourceWidthPixels = sourceSvgSizeMm.width * pixelsPerMm;
+    const sourceHeightPixels = sourceSvgSizeMm.height * pixelsPerMm;
+
+    context.save();
+    context.translate(posX * pixelsPerMm, posY * pixelsPerMm);
+    context.rotate(rotation);
+    context.scale(scale, scale);
+    context.drawImage(
+        originalSVGImage,
+        -sourceWidthPixels / 2,
+        -sourceHeightPixels / 2,
+        sourceWidthPixels,
+        sourceHeightPixels
+    );
+    context.restore();
+
+    return { canvas, context, pixelsPerMm };
+}
+
+function analyzeArtworkForBestGuess(canvas, context, pixelsPerMm, penThickness) {
+    let imageData;
+    try {
+        imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+    } catch (error) {
+        throw new Error('Embed cross-origin SVG images as data URLs before using Best Guess.');
+    }
+
+    const width = canvas.width;
+    const height = canvas.height;
+    const pixels = width * height;
+    const darknessMap = new Float32Array(pixels);
+    const histogram = new Uint32Array(256);
+    const data = imageData.data;
+    let activePixels = 0;
+    let darknessSum = 0;
+    let minX = width;
+    let minY = height;
+    let maxX = -1;
+    let maxY = -1;
+
+    for (let pixelIndex = 0, dataIndex = 0; pixelIndex < pixels; pixelIndex += 1, dataIndex += 4) {
+        const alpha = data[dataIndex + 3] / 255;
+        if (alpha <= 0.01) continue;
+        const luminance = (
+            (0.2126 * data[dataIndex]) +
+            (0.7152 * data[dataIndex + 1]) +
+            (0.0722 * data[dataIndex + 2])
+        ) / 255;
+        const darkness = clampBestGuessValue((1 - luminance) * alpha, 0, 1);
+        darknessMap[pixelIndex] = darkness;
+        if (darkness <= (1 / 255)) continue;
+
+        const x = pixelIndex % width;
+        const y = Math.floor(pixelIndex / width);
+        activePixels += 1;
+        darknessSum += darkness;
+        histogram[Math.max(1, Math.min(255, Math.round(darkness * 255)))] += 1;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+    }
+
+    if (activePixels < 16 || maxX < minX || maxY < minY) {
+        throw new Error('The enabled SVG layers do not contain enough visible non-white artwork to analyze.');
+    }
+
+    const p04 = histogramPercentile(histogram, activePixels, 0.04);
+    const p08 = histogramPercentile(histogram, activePixels, 0.08);
+    const p25 = histogramPercentile(histogram, activePixels, 0.25);
+    const p50 = histogramPercentile(histogram, activePixels, 0.50);
+    const p90 = histogramPercentile(histogram, activePixels, 0.90);
+    const contrast = clampBestGuessValue(p90 - p04, 0, 1);
+    const meanDarkness = darknessSum / activePixels;
+
+    // Reject only the lowest light tail. The lower-quartile cap prevents a pale drawing
+    // from being mistaken for background noise, while the floor removes raster/AA haze.
+    const cutoff = clampBestGuessValue(
+        Math.max(0.015, Math.min(p08 * 0.88, p25 * 0.48)),
+        0.015,
+        0.18
+    );
+
+    let belowCutoff = 0;
+    const cutoffBin = Math.max(0, Math.min(255, Math.floor(cutoff * 255)));
+    for (let index = 0; index <= cutoffBin; index += 1) belowCutoff += histogram[index];
+    const excludedFraction = belowCutoff / activePixels;
+
+    const orientationBins = new Float64Array(18);
+    let orientationWeight = 0;
+    let edgeSamples = 0;
+    let testedSamples = 0;
+    const sampleStep = Math.max(1, Math.round(Math.max(width, height) / 650));
+    const xStart = Math.max(1, minX + 1);
+    const xEnd = Math.min(width - 2, maxX - 1);
+    const yStart = Math.max(1, minY + 1);
+    const yEnd = Math.min(height - 2, maxY - 1);
+
+    for (let y = yStart; y <= yEnd; y += sampleStep) {
+        for (let x = xStart; x <= xEnd; x += sampleStep) {
+            const index = (y * width) + x;
+            const center = darknessMap[index];
+            const left = darknessMap[index - 1];
+            const right = darknessMap[index + 1];
+            const above = darknessMap[index - width];
+            const below = darknessMap[index + width];
+            if (Math.max(center, left, right, above, below) <= cutoff * 0.45) continue;
+
+            testedSamples += 1;
+            const gradientX = (right - left) * 0.5;
+            const gradientY = (below - above) * 0.5;
+            const gradient = Math.hypot(gradientX, gradientY);
+            if (gradient < 0.018) continue;
+
+            edgeSamples += 1;
+            let tangentAngle = Math.atan2(gradientY, gradientX) + (Math.PI / 2);
+            while (tangentAngle < 0) tangentAngle += Math.PI;
+            while (tangentAngle >= Math.PI) tangentAngle -= Math.PI;
+            const bin = Math.min(orientationBins.length - 1, Math.floor((tangentAngle / Math.PI) * orientationBins.length));
+            orientationBins[bin] += gradient;
+            orientationWeight += gradient;
+        }
+    }
+
+    const edgeDensity = testedSamples ? edgeSamples / testedSamples : 0;
+    const detailScore = clampBestGuessValue((edgeDensity * 3.2) + (contrast * 0.45), 0, 1);
+    let occupiedToneBins = 0;
+    const occupiedThreshold = Math.max(1, activePixels * 0.001);
+    for (let index = 1; index < histogram.length; index += 1) {
+        if (histogram[index] >= occupiedThreshold) occupiedToneBins += 1;
+    }
+    const tonalComplexity = clampBestGuessValue(occupiedToneBins / 72, 0, 1);
+
+    let dominantBin = 0;
+    for (let index = 1; index < orientationBins.length; index += 1) {
+        if (orientationBins[index] > orientationBins[dominantBin]) dominantBin = index;
+    }
+    const orientationCoherence = orientationWeight > 0 ? orientationBins[dominantBin] / orientationWeight : 0;
+    const artworkWidth = Math.max(1, maxX - minX + 1);
+    const artworkHeight = Math.max(1, maxY - minY + 1);
+    let patternAngle;
+    if (orientationCoherence >= 0.16) {
+        const dominantTangent = ((dominantBin + 0.5) / orientationBins.length) * 180;
+        patternAngle = (dominantTangent + 45) % 180;
+    } else if (artworkWidth > artworkHeight * 1.35) {
+        patternAngle = 35;
+    } else if (artworkHeight > artworkWidth * 1.35) {
+        patternAngle = 55;
+    } else {
+        patternAngle = 45;
+    }
+    patternAngle = Math.round(patternAngle / 5) * 5;
+
+    const noisePenalty = clampBestGuessValue(excludedFraction * 2.5, 0, 0.35);
+    const spacingMultiplier = clampBestGuessValue(1.58 - (detailScore * 0.34) + noisePenalty, 1.12, 1.82);
+    const patternSpacing = Math.max(penThickness * 1.05, penThickness * spacingMultiplier);
+    const waveform = tonalComplexity >= 0.48 ? 'sine' : 'zigzag';
+    const waveAmplitude = clampBestGuessValue(
+        patternSpacing * (waveform === 'sine' ? 0.42 : 0.50) * (0.82 + (detailScore * 0.18)),
+        penThickness * 0.25,
+        patternSpacing * 0.56
+    );
+    const waveLength = Math.max(
+        penThickness * 4,
+        patternSpacing * (5.4 - (detailScore * 1.9))
+    );
+    const densityFudge = clampBestGuessValue((0.42 - meanDarkness) * 0.16, -0.08, 0.08);
+    const brightnessModulation = excludedFraction > 0.12
+        ? 'amplitude'
+        : (tonalComplexity >= 0.36 ? 'both' : 'amplitude');
+
+    return {
+        cutoff,
+        densityFudge,
+        patternLayout: 'linear',
+        waveform,
+        patternSpacing,
+        patternAngle,
+        patternCenterX: ((minX + maxX) / 2) / pixelsPerMm,
+        patternCenterY: ((minY + maxY) / 2) / pixelsPerMm,
+        waveAmplitude,
+        waveLength,
+        brightnessModulation,
+        excludedFraction,
+        detailScore,
+        tonalComplexity,
+        activePixels,
+    };
+}
+
+async function applyBestGuessSettings() {
+    const button = document.getElementById('bestGuessBtn');
+    const status = document.getElementById('bestGuessStatus');
+    if (!button || !status) return;
+
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Analyzing SVG...';
+    status.textContent = 'Rasterizing the enabled layers and measuring tone, edge detail, and the light-noise tail...';
+
+    try {
+        if (!layerEntries.some(layer => layer.enabled)) {
+            throw new Error('Enable at least one SVG layer before running Best Guess.');
+        }
+
+        const penInput = document.getElementById('penThickness');
+        let penThickness = Number.parseFloat(penInput.value);
+        let assumedPen = false;
+        if (!Number.isFinite(penThickness) || penThickness < 0.05 || penThickness > 10) {
+            penThickness = 0.5;
+            penInput.value = '0.5';
+            assumedPen = true;
+        }
+
+        const rendered = renderBestGuessAnalysisCanvas();
+        const guess = analyzeArtworkForBestGuess(
+            rendered.canvas,
+            rendered.context,
+            rendered.pixelsPerMm,
+            penThickness
+        );
+
+        document.getElementById('brightnessCutoff').value = formatNumber(guess.cutoff, 3);
+        document.getElementById('densityFudge').value = formatNumber(guess.densityFudge, 3);
+        document.getElementById('patternLayout').value = guess.patternLayout;
+        document.getElementById('waveform').value = guess.waveform;
+        document.getElementById('patternSpacing').value = formatNumber(guess.patternSpacing, 3);
+        document.getElementById('patternAngle').value = formatNumber(guess.patternAngle, 1);
+        document.getElementById('patternCenterX').value = formatNumber(guess.patternCenterX, 3);
+        document.getElementById('patternCenterY').value = formatNumber(guess.patternCenterY, 3);
+        document.getElementById('patternClockwise').checked = true;
+        document.getElementById('waveAmplitude').value = formatNumber(guess.waveAmplitude, 3);
+        document.getElementById('waveLength').value = formatNumber(guess.waveLength, 3);
+        document.getElementById('brightnessModulation').value = guess.brightnessModulation;
+        document.getElementById('showBrightnessCutoffPreview').checked = true;
+
+        updatePatternControlVisibility();
+        updatePatternCenterMarker();
+        saveMachineSettings();
+        saveUiSettings();
+        await refreshBrightnessCutoffPreview();
+
+        const assumedText = assumedPen ? ' Assumed a 0.5 mm pen because no valid pen size was set.' : '';
+        status.textContent = `Applied ${guess.waveform} ${guess.patternLayout} at ${formatNumber(guess.patternAngle, 0)}°, cutoff ${formatNumber(guess.cutoff, 3)}, spacing ${formatNumber(guess.patternSpacing, 2)} mm, amplitude ${formatNumber(guess.waveAmplitude, 2)} mm, and wavelength ${formatNumber(guess.waveLength, 2)} mm. Estimated detail ${formatNumber(guess.detailScore * 100, 0)}%; light-tail exclusion ${formatNumber(guess.excludedFraction * 100, 1)}%.${assumedText}`;
+        document.getElementById('generationStatus').textContent = 'Best Guess settings applied. Review the red cutoff preview, then generate the toolpath.';
+    } catch (error) {
+        console.error('Best Guess analysis failed:', error);
+        status.textContent = `Best Guess unavailable: ${error.message}`;
+        document.getElementById('generationStatus').textContent = `Best Guess failed: ${error.message}`;
+    } finally {
+        button.disabled = false;
+        button.textContent = originalLabel;
+    }
+}
+
 function updateSimulationControls() {
     const stopButton = document.getElementById('stopSimBtn');
     if (stopButton) stopButton.disabled = !isAnimating;
@@ -830,6 +1122,7 @@ document.getElementById('showBrightnessCutoffPreview').addEventListener('change'
     saveUiSettings();
     scheduleBrightnessCutoffPreview(0);
 });
+document.getElementById('bestGuessBtn').addEventListener('click', applyBestGuessSettings);
 document.getElementById('centerPatternBtn').addEventListener('click', setPatternCenterToWorkspace);
 document.getElementById('pickPatternCenterBtn').addEventListener('click', () => {
     setPatternCenterPicking(!pickingPatternCenter);
