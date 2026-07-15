@@ -1,4 +1,10 @@
-paper.setup(document.getElementById('canvas'));
+const toolpathCanvasElement = document.getElementById('canvas');
+if (!window.paper) {
+    const status = document.getElementById('generationStatus');
+    if (status) status.textContent = 'HatchPlot could not load its canvas engine. Rebuild the frontend container and refresh the page.';
+    throw new Error('Paper.js failed to load.');
+}
+paper.setup(toolpathCanvasElement);
 
 // --- STATE ---
 let originalSVG = null;
@@ -1371,15 +1377,6 @@ function offerAutoScaleToFit(reason = 'upload') {
     return true;
 }
 
-restoreStoredSettings();
-lastWorkspaceOrigin = getWorkspaceOrigin();
-installGenerationTooltips();
-updateGenerationModeVisibility();
-updatePatternControlVisibility();
-updateWorkspaceOriginUi();
-if (document.getElementById('autoCenter').checked) setCenterInputs();
-initWorkspace(true);
-
 window.addEventListener('resize', () => initWorkspace(false));
 
 const canvasShell = document.querySelector('.canvas-shell');
@@ -1578,18 +1575,40 @@ document.addEventListener('keydown', event => {
         document.getElementById('generationStatus').textContent = 'Pattern-center selection cancelled.';
     }
 });
-document.getElementById('machineContinueBtn')?.addEventListener('click', () => {
-    markMachineSetupConfigured();
-    saveMachineSettings();
-    openSidebarSection('importSection');
-});
-document.getElementById('artworkContinueBtn')?.addEventListener('click', () => {
-    if (!originalSVGText) return;
-    openSidebarSection('generateSection');
-});
-MACHINE_SETUP_FIELD_IDS.forEach(id => {
-    document.getElementById(id)?.addEventListener('change', markMachineSetupConfigured);
-});
+function bindWorkflowNavigation() {
+    const machineContinueButton = document.getElementById('machineContinueBtn');
+    const artworkContinueButton = document.getElementById('artworkContinueBtn');
+
+    if (machineContinueButton && machineContinueButton.dataset.workflowBound !== 'true') {
+        machineContinueButton.dataset.workflowBound = 'true';
+        machineContinueButton.addEventListener('click', () => {
+            markMachineSetupConfigured();
+            saveMachineSettings();
+            openSidebarSection('importSection');
+            document.getElementById('svgInput')?.focus();
+        });
+    }
+
+    if (artworkContinueButton && artworkContinueButton.dataset.workflowBound !== 'true') {
+        artworkContinueButton.dataset.workflowBound = 'true';
+        artworkContinueButton.addEventListener('click', () => {
+            if (!originalSVGText || !originalSVG) {
+                generationStatus.textContent = 'Load a valid SVG before continuing to toolpath generation.';
+                openSidebarSection('importSection');
+                return;
+            }
+            openSidebarSection('generateSection');
+            document.getElementById('generateBtn')?.focus();
+        });
+    }
+
+    MACHINE_SETUP_FIELD_IDS.forEach(id => {
+        const input = document.getElementById(id);
+        if (!input || input.dataset.machineSetupBound === 'true') return;
+        input.dataset.machineSetupBound = 'true';
+        input.addEventListener('change', markMachineSetupConfigured);
+    });
+}
 
 // --- FILE UPLOAD AND CONVERTER TRANSFER ---
 async function loadSvgText(svgText, filename = 'uploaded.svg', sourceLabel = 'Uploaded') {
@@ -2684,11 +2703,32 @@ paper.view.onFrame = function() {
     }
 };
 
-// Run workflow initialization only after all output naming and G-code
-// constants have been initialized. Calling these earlier aborts app.js in the
-// temporal dead zone and prevents the SVG upload handlers from being installed.
-renderLayerControls();
-updateArtworkWorkflowUi();
-updateMachiningEstimateUi();
-updateOutputFilenamePreview();
-consumePendingConvertedSvg();
+function initializeHatchPlot() {
+    try {
+        restoreStoredSettings();
+        lastWorkspaceOrigin = getWorkspaceOrigin();
+        installGenerationTooltips();
+        updateGenerationModeVisibility();
+        updatePatternControlVisibility();
+        updateWorkspaceOriginUi();
+        if (document.getElementById('autoCenter').checked) setCenterInputs();
+        initWorkspace(true);
+        renderLayerControls();
+        updateArtworkWorkflowUi();
+        updateMachiningEstimateUi();
+        updateOutputFilenamePreview();
+        bindWorkflowNavigation();
+        consumePendingConvertedSvg();
+        document.body.dataset.hatchPlotReady = 'true';
+    } catch (error) {
+        console.error('Unable to initialize HatchPlot:', error);
+        document.body.dataset.hatchPlotReady = 'false';
+        const status = document.getElementById('generationStatus');
+        if (status) status.textContent = `HatchPlot failed to initialize: ${error.message}`;
+    }
+}
+
+// app.js is loaded at the end of <body>, so all DOM nodes and all module-level
+// constants are available here. Keeping initialization in one final step avoids
+// partial startup where navigation and SVG handlers are never installed.
+initializeHatchPlot();

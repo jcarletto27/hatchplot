@@ -1,0 +1,8 @@
+{
+  "name": "hatchplot-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "paper": "0.12.17"
+  }
+}
