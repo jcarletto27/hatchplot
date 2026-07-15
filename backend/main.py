@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import threading
+import textwrap
 import time
 from multiprocessing import Manager
 import traceback
@@ -51,6 +52,7 @@ MAX_TOOLPATH_POINTS = int(os.getenv("MAX_TOOLPATH_POINTS", "500000"))
 MAX_LIVE_PREVIEW_POINTS = int(os.getenv("MAX_LIVE_PREVIEW_POINTS", "20000"))
 LIVE_PREVIEW_CHUNK_POINTS = int(os.getenv("LIVE_PREVIEW_CHUNK_POINTS", "1600"))
 DEFAULT_BRIGHTNESS_CUTOFF = float(os.getenv("DEFAULT_BRIGHTNESS_CUTOFF", "0.025"))
+GCODE_MAX_LINE_LENGTH = 64
 MAX_RETAINED_RESULTS = max(1, int(os.getenv("MAX_RETAINED_RESULTS", "4")))
 MAX_PENDING_JOBS = int(os.getenv("MAX_PENDING_JOBS", "4"))
 JOB_WORKERS = max(1, int(os.getenv("JOB_WORKERS", "1")))
@@ -1480,6 +1482,24 @@ def _gcode_comment_value(value: Any) -> str:
     return " ".join(text.replace("\r", " ").replace("\n", " ").split())
 
 
+def _gcode_comment_lines(value: Any) -> list[str]:
+    """Return semicolon comments that fit strict controller line limits."""
+    text = _gcode_comment_value(value)
+    if not text:
+        return [";"]
+
+    return textwrap.wrap(
+        text,
+        width=GCODE_MAX_LINE_LENGTH,
+        initial_indent="; ",
+        subsequent_indent="; ",
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=True,
+        drop_whitespace=True,
+    )
+
+
 def _workspace_output_point(x: float, y: float, params: dict[str, Any]) -> tuple[float, float]:
     bed_x = float(params["bedX"])
     bed_y = float(params["bedY"])
@@ -1505,31 +1525,42 @@ def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
         params,
     )
     direction = "clockwise" if bool(params.get("patternClockwise", True)) else "counterclockwise"
-    lines = [
-        "; HatchPlot generated G-code",
-        f"; Source SVG: {_gcode_comment_value(params.get('sourceFilename', 'uploaded.svg'))}",
-        f"; Enabled layers: {_gcode_comment_value(layers_text)}",
-        f"; Machine bed: {float(params['bedX']):.3f} x {float(params['bedY']):.3f} mm",
-        f"; Workspace origin: {workspace_origin}",
-        f"; Generation mode: {generation_mode}",
-        f"; Z control: {_gcode_comment_value(params['zMode'])}; up={_gcode_comment_value(params['zUp'])}; down={_gcode_comment_value(params['zDown'])}; plunge={int(params['zPlungeRate'])} mm/min",
-        f"; XY feed rate: {int(params['xyFeedRate'])} mm/min",
-        f"; Pen size: {float(params.get('penThickness', 0.5)):.3f} mm",
-        f"; SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({display_svg_x:.3f}, {display_svg_y:.3f}) mm",
+    comments = [
+        "HatchPlot generated G-code",
+        f"Source SVG: {_gcode_comment_value(params.get('sourceFilename', 'uploaded.svg'))}",
+        f"Enabled layers: {_gcode_comment_value(layers_text)}",
+        f"Machine bed: {float(params['bedX']):.3f} x {float(params['bedY']):.3f} mm",
+        f"Workspace origin: {workspace_origin}",
+        f"Generation mode: {generation_mode}",
+        f"Z control: {_gcode_comment_value(params['zMode'])}; up={_gcode_comment_value(params['zUp'])}; down={_gcode_comment_value(params['zDown'])}; plunge={int(params['zPlungeRate'])} mm/min",
+        f"XY feed rate: {int(params['xyFeedRate'])} mm/min",
+        f"Pen size: {float(params.get('penThickness', 0.5)):.3f} mm",
+        f"SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({display_svg_x:.3f}, {display_svg_y:.3f}) mm",
     ]
     if generation_mode in {"outline", "outline-hatch"}:
-        lines.append("; Outline: traces native SVG vector geometry; stroked paths follow their centerlines and filled shapes follow their vector boundaries")
+        comments.append(
+            "Outline: traces native SVG vector geometry; stroked paths "
+            "follow their centerlines and filled shapes follow their "
+            "vector boundaries"
+        )
     if generation_mode in {"hatch", "outline-hatch"}:
-        lines.extend([
-            f"; Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
-            f"; Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={float(params.get('patternSpacing', 1.0)):.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({display_center_x:.3f}, {display_center_y:.3f}) mm; direction={direction}",
-            f"; Waveform: type={_gcode_comment_value(params.get('waveform', 'zigzag'))}; amplitude={float(params.get('waveAmplitude', 0.5)):.3f} mm; wavelength={float(params.get('waveLength', 3.0)):.3f} mm",
+        comments.extend([
+            f"Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
+            f"Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={float(params.get('patternSpacing', 1.0)):.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({display_center_x:.3f}, {display_center_y:.3f}) mm; direction={direction}",
+            f"Waveform: type={_gcode_comment_value(params.get('waveform', 'zigzag'))}; amplitude={float(params.get('waveAmplitude', 0.5)):.3f} mm; wavelength={float(params.get('waveLength', 3.0)):.3f} mm",
         ])
     if generation_mode == "outline-hatch":
-        lines.append("; Sequence: native SVG outlines are plotted first, followed by brightness-driven hatch paths")
+        comments.append(
+            "Sequence: native SVG outlines are plotted first, followed "
+            "by brightness-driven hatch paths"
+        )
+    comments.extend([
+        f"Toolpaths: {path_count}",
+        "End HatchPlot header",
+    ])
+
+    lines = [line for comment in comments for line in _gcode_comment_lines(comment)]
     lines.extend([
-        f"; Toolpaths: {path_count}",
-        "; End HatchPlot header",
         "G21",
         "G90",
         f"G0 Z{params['zUp']}" if params["zMode"] == "stepper" else f"M3 S{params['zUp']}",

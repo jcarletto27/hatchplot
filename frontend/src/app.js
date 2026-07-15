@@ -1845,8 +1845,46 @@ function currentGcodeSettings() {
     };
 }
 
+const GCODE_MAX_LINE_LENGTH = 64;
+
 function gcodeCommentValue(value) {
     return String(value ?? '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function gcodeCommentLines(value) {
+    const text = gcodeCommentValue(value);
+    if (!text) return [';'];
+
+    const contentWidth = GCODE_MAX_LINE_LENGTH - 2;
+    const lines = [];
+    let current = '';
+
+    const pushCurrent = () => {
+        if (!current) return;
+        lines.push(`; ${current}`);
+        current = '';
+    };
+
+    for (const originalWord of text.split(' ')) {
+        let word = originalWord;
+        while (word.length > contentWidth) {
+            pushCurrent();
+            lines.push(`; ${word.slice(0, contentWidth)}`);
+            word = word.slice(contentWidth);
+        }
+        if (!word) continue;
+
+        if (!current) {
+            current = word;
+        } else if (current.length + 1 + word.length <= contentWidth) {
+            current += ` ${word}`;
+        } else {
+            pushCurrent();
+            current = word;
+        }
+    }
+    pushCurrent();
+    return lines;
 }
 
 function gcodeFixed(value) {
@@ -1860,40 +1898,52 @@ function buildGcodeHeader(settings, pathCount = null) {
         : 'All visible layers';
     const direction = settings.patternClockwise ? 'clockwise' : 'counterclockwise';
     const toolpathCount = Number.isInteger(pathCount) ? String(pathCount) : 'live preview';
-    const lines = [
-        '; HatchPlot generated G-code',
-        `; Source SVG: ${gcodeCommentValue(settings.sourceFilename)}`,
-        `; Enabled layers: ${layers}`,
-        `; Machine bed: ${gcodeFixed(settings.bedX)} x ${gcodeFixed(settings.bedY)} mm`,
-        `; Workspace origin: ${gcodeCommentValue(settings.workspaceOrigin)}`,
-        `; Generation mode: ${gcodeCommentValue(settings.generationMode)}`,
-        `; Z control: ${gcodeCommentValue(settings.zMode)}; up=${gcodeCommentValue(settings.zUp)}; down=${gcodeCommentValue(settings.zDown)}; plunge=${settings.zPlungeRate} mm/min`,
-        `; XY feed rate: ${settings.xyFeedRate} mm/min`,
-        `; Pen size: ${gcodeFixed(settings.penThickness)} mm`,
-        `; SVG transform: scale=${gcodeFixed(settings.svgScale)}% (${gcodeCommentValue(settings.svgScaleMode)}); rotation=${gcodeFixed(settings.svgRotate)} deg; center=(${gcodeFixed(settings.svgPosX)}, ${gcodeFixed(settings.svgPosY)}) mm`,
+    const comments = [
+        'HatchPlot generated G-code',
+        `Source SVG: ${gcodeCommentValue(settings.sourceFilename)}`,
+        `Enabled layers: ${layers}`,
+        `Machine bed: ${gcodeFixed(settings.bedX)} x ${gcodeFixed(settings.bedY)} mm`,
+        `Workspace origin: ${gcodeCommentValue(settings.workspaceOrigin)}`,
+        `Generation mode: ${gcodeCommentValue(settings.generationMode)}`,
+        `Z control: ${gcodeCommentValue(settings.zMode)}; up=${gcodeCommentValue(settings.zUp)}; down=${gcodeCommentValue(settings.zDown)}; plunge=${settings.zPlungeRate} mm/min`,
+        `XY feed rate: ${settings.xyFeedRate} mm/min`,
+        `Pen size: ${gcodeFixed(settings.penThickness)} mm`,
+        `SVG transform: scale=${gcodeFixed(settings.svgScale)}% (${gcodeCommentValue(settings.svgScaleMode)}); rotation=${gcodeFixed(settings.svgRotate)} deg; center=(${gcodeFixed(settings.svgPosX)}, ${gcodeFixed(settings.svgPosY)}) mm`,
     ];
     if (generationModeUsesOutline(settings.generationMode)) {
-        lines.push('; Outline: traces native SVG vector geometry; stroked paths follow their centerlines and filled shapes follow their vector boundaries');
+        comments.push(
+            'Outline: traces native SVG vector geometry; stroked paths ' +
+            'follow their centerlines and filled shapes follow their ' +
+            'vector boundaries'
+        );
     }
     if (generationModeUsesHatch(settings.generationMode)) {
-        lines.push(
-            `; Brightness: cutoff=${gcodeFixed(settings.brightnessCutoff)}; density fudge=${Number(settings.densityFudge) >= 0 ? '+' : ''}${gcodeFixed(settings.densityFudge)}; modulation=${gcodeCommentValue(settings.brightnessModulation)}`,
-            `; Pattern: layout=${gcodeCommentValue(settings.patternLayout)}; spacing=${gcodeFixed(settings.patternSpacing)} mm; angle=${gcodeFixed(settings.patternAngle)} deg; center=(${gcodeFixed(settings.patternCenterX)}, ${gcodeFixed(settings.patternCenterY)}) mm; direction=${direction}`,
-            `; Waveform: type=${gcodeCommentValue(settings.waveform)}; amplitude=${gcodeFixed(settings.waveAmplitude)} mm; wavelength=${gcodeFixed(settings.waveLength)} mm`
+        comments.push(
+            `Brightness: cutoff=${gcodeFixed(settings.brightnessCutoff)}; density fudge=${Number(settings.densityFudge) >= 0 ? '+' : ''}${gcodeFixed(settings.densityFudge)}; modulation=${gcodeCommentValue(settings.brightnessModulation)}`,
+            `Pattern: layout=${gcodeCommentValue(settings.patternLayout)}; spacing=${gcodeFixed(settings.patternSpacing)} mm; angle=${gcodeFixed(settings.patternAngle)} deg; center=(${gcodeFixed(settings.patternCenterX)}, ${gcodeFixed(settings.patternCenterY)}) mm; direction=${direction}`,
+            `Waveform: type=${gcodeCommentValue(settings.waveform)}; amplitude=${gcodeFixed(settings.waveAmplitude)} mm; wavelength=${gcodeFixed(settings.waveLength)} mm`
         );
     }
     if (settings.generationMode === 'outline-hatch') {
-        lines.push('; Sequence: native SVG outlines are plotted first, followed by brightness-driven hatch paths');
+        comments.push(
+            'Sequence: native SVG outlines are plotted first, followed ' +
+            'by brightness-driven hatch paths'
+        );
     }
+    comments.push(
+        `Toolpaths: ${toolpathCount}`,
+        'End HatchPlot header'
+    );
+
+    const lines = comments.flatMap(gcodeCommentLines);
     lines.push(
-        `; Toolpaths: ${toolpathCount}`,
-        '; End HatchPlot header',
         'G21',
         'G90',
         settings.zMode === 'stepper' ? `G0 Z${settings.zUp}` : `M3 S${settings.zUp}`
     );
     return lines;
 }
+
 
 function canvasPointToGcode(point) {
     return canvasToWorkspacePoint(Number(point[0]), Number(point[1]));
