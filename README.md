@@ -7,13 +7,19 @@ HatchPlot converts SVG artwork into plotter-ready G-code. It combines a browser 
 - SVG upload with layer enable/disable controls.
 - Physical SVG scale, rotation, placement, automatic centering, and fit-to-workspace handling.
 - Top-left, top-right, bottom-left, or bottom-right machine-coordinate origins.
-- Persistent machine, generation, simulation, and workspace settings.
-- Canvas zoom, source-SVG visibility, pattern-center pin placement, and brightness-cutoff exclusion preview.
+- Persistent machine, generation, simulation, and workspace settings, with a single-card guided workflow.
+- Canvas zoom and panning, source-SVG visibility, pattern-center pin placement, and brightness-cutoff exclusion preview.
 - Background generation jobs with live progress, cancellation, estimated remaining time, and streamed toolpath preview.
 - G-code simulation up to 300× speed with synchronized line highlighting.
-- G-code export with a detailed header describing the machine, SVG, transform, layers, generation mode, pattern, waveform, brightness controls, and path count.
+- `.nc` export using `{first-8-source-characters}-{origin}-{generation}-{layout}.nc`, with layout omitted when it does not apply.
+- A 64-character-safe G-code header describing the output filename, machine, SVG, transform, layers, generation mode, pattern, waveform, brightness controls, path count, and estimated machining time.
+- Machining-time estimation from drawing distance, pen-up travel, configured XY feed, and a 0.5-second delay for each pen-up and pen-down action.
 - A one-click **Best Guess** analyzer that selects conservative detail-first hatch settings from the transformed artwork.
 - Tooltips for generation values, layouts, waveforms, and coordinate options.
+
+The Toolpath workspace opens one setup card at a time. New installations begin at **Machine Setup**; after machine settings have been saved once, later visits begin at **Artwork & Placement**. Use middle-mouse drag or Ctrl+left-mouse drag to pan the toolpath canvas.
+
+Export names use two-letter origin codes (`TL`, `TR`, `BL`, or `BR`) and generation codes (`OUTLINE`, `HATCH`, or `OTH`). For example, an Outline then Hatch job using a spiral layout from `rapunzel.svg` with a bottom-left origin exports as `rapunzel-BL-OTH-Spiral.nc`.
 
 ### Generation modes
 
@@ -25,7 +31,7 @@ Hatch layouts include linear, spiral, concentric, and radial carriers. Waveforms
 
 ## Image to SVG page
 
-Open **Image to SVG** from the HatchPlot header or visit `/converter.html`.
+Use the workspace switch at the top of either page to move between **Toolpath** and **Image Conversion**, or visit `/converter.html` directly.
 
 The converter accepts browser-readable raster formats including PNG, JPEG, WebP, BMP, GIF, and AVIF. It produces plotter-oriented, polyline-only SVG files with three modes:
 

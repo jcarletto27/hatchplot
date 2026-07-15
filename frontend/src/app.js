@@ -36,9 +36,14 @@ let brightnessCutoffOverlay = null;
 let brightnessCutoffPreviewToken = 0;
 let brightnessCutoffPreviewTimer = null;
 let lastWorkspaceOrigin = 'top-left';
+let canvasPanState = null;
+let accordionSyncing = false;
+let latestMachiningEstimate = null;
+let generatedOutputFilename = null;
 
 const MACHINE_SETTINGS_KEY = 'hatchPlotter.machineSettings.v1';
 const UI_SETTINGS_KEY = 'hatchPlotter.uiSettings.v1';
+const MACHINE_SETUP_COMPLETE_KEY = 'hatchPlotter.machineSetupConfigured.v1';
 const SVG_TRANSFER_DB = 'hatchplot-artwork-transfer-v1';
 const SVG_TRANSFER_STORE = 'pending-artwork';
 const SVG_TRANSFER_KEY = 'pending';
@@ -47,7 +52,8 @@ const FIT_MARGIN = 0.9;
 const MM_PER_CSS_PIXEL = 25.4 / 96;
 const MAX_BRIGHTNESS_MAP_DIMENSION = 4096;
 const INKSCAPE_NAMESPACE = 'http://www.inkscape.org/namespaces/inkscape';
-const COLLAPSIBLE_SECTION_IDS = ['machineSection', 'importSection', 'generateSection', 'gcodeSection'];
+const SIDEBAR_SECTION_IDS = ['machineSection', 'importSection', 'generateSection'];
+const MACHINE_SETUP_FIELD_IDS = ['bedX', 'bedY', 'workspaceOrigin', 'zMode', 'zUp', 'zDown', 'xyFeedRate', 'zPlungeRate'];
 const MACHINE_SETTING_IDS = [
     'bedX',
     'bedY',
@@ -487,6 +493,54 @@ function ensurePenThickness() {
     return thickness;
 }
 
+function machineSetupHasBeenConfigured() {
+    try {
+        if (localStorage.getItem(MACHINE_SETUP_COMPLETE_KEY) === 'true') return true;
+        const legacySettings = JSON.parse(localStorage.getItem(MACHINE_SETTINGS_KEY) || '{}');
+        const configured = MACHINE_SETUP_FIELD_IDS.some(id => legacySettings[id] !== undefined && legacySettings[id] !== null);
+        if (configured) localStorage.setItem(MACHINE_SETUP_COMPLETE_KEY, 'true');
+        return configured;
+    } catch (_error) {
+        return false;
+    }
+}
+
+function markMachineSetupConfigured() {
+    try {
+        localStorage.setItem(MACHINE_SETUP_COMPLETE_KEY, 'true');
+    } catch (error) {
+        console.warn('Unable to remember machine setup completion:', error);
+    }
+}
+
+function openSidebarSection(sectionId, persist = true) {
+    if (!SIDEBAR_SECTION_IDS.includes(sectionId)) return;
+    accordionSyncing = true;
+    SIDEBAR_SECTION_IDS.forEach(id => {
+        const section = document.getElementById(id);
+        if (section) section.open = id === sectionId;
+    });
+    accordionSyncing = false;
+    if (persist) saveUiSettings();
+}
+
+function activeSidebarSection() {
+    return SIDEBAR_SECTION_IDS.find(id => document.getElementById(id)?.open) || null;
+}
+
+function updateArtworkWorkflowUi() {
+    const hasArtwork = Boolean(originalSVGText && originalSVG);
+    const continueButton = document.getElementById('artworkContinueBtn');
+    const status = document.getElementById('artworkWorkflowStatus');
+    const sourceBadge = document.getElementById('sourceFileBadge');
+    if (continueButton) continueButton.disabled = !hasArtwork;
+    if (status) status.textContent = hasArtwork
+        ? `${currentSourceFilename} is ready. Confirm placement, then continue.`
+        : 'Load and position artwork before generating.';
+    if (sourceBadge) sourceBadge.textContent = hasArtwork ? currentSourceFilename : 'No SVG loaded';
+    updateOutputFilenamePreview();
+}
+
 function restoreStoredSettings() {
     try {
         const machineSettings = JSON.parse(localStorage.getItem(MACHINE_SETTINGS_KEY) || '{}');
@@ -512,11 +566,12 @@ function restoreStoredSettings() {
         if (typeof uiSettings.showBrightnessCutoffPreview === 'boolean') {
             document.getElementById('showBrightnessCutoffPreview').checked = uiSettings.showBrightnessCutoffPreview;
         }
-        const sectionStates = uiSettings.sectionStates || {};
-        COLLAPSIBLE_SECTION_IDS.forEach(id => {
-            const section = document.getElementById(id);
-            if (section && typeof sectionStates[id] === 'boolean') section.open = sectionStates[id];
-        });
+        const defaultSection = machineSetupHasBeenConfigured() ? 'importSection' : 'machineSection';
+        openSidebarSection(defaultSection, false);
+        if (typeof uiSettings.gcodeOpen === 'boolean') {
+            const gcodeSection = document.getElementById('gcodeSection');
+            if (gcodeSection) gcodeSection.open = uiSettings.gcodeOpen;
+        }
     } catch (error) {
         console.warn('Unable to restore saved HatchPlot settings:', error);
     }
@@ -543,17 +598,13 @@ function saveMachineSettings() {
 
 function saveUiSettings() {
     try {
-        const sectionStates = {};
-        COLLAPSIBLE_SECTION_IDS.forEach(id => {
-            const section = document.getElementById(id);
-            if (section) sectionStates[id] = section.open;
-        });
         localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify({
             autoCenter: document.getElementById('autoCenter').checked,
             autoPreviewGeneration: document.getElementById('autoPreviewGeneration').checked,
             hideSourceSvg: document.getElementById('hideSourceSvg').checked,
             showBrightnessCutoffPreview: document.getElementById('showBrightnessCutoffPreview').checked,
-            sectionStates
+            activeSidebarSection: activeSidebarSection(),
+            gcodeOpen: Boolean(document.getElementById('gcodeSection')?.open)
         }));
     } catch (error) {
         console.warn('Unable to save HatchPlot UI settings:', error);
@@ -1003,7 +1054,13 @@ function clearGeneratedPreview(resetGcode = true, resetStopState = true) {
     }
     isAnimating = false;
     if (resetStopState) simulationStoppedByUser = false;
-    if (resetGcode) setGcodeLines([]);
+    if (resetGcode) {
+        setGcodeLines([]);
+        latestMachiningEstimate = null;
+        generatedOutputFilename = null;
+        updateMachiningEstimateUi();
+        updateOutputFilenamePreview();
+    }
     updateSimulationControls();
     syncSourceSvgVisibility();
 }
@@ -1358,12 +1415,14 @@ document.getElementById('workspaceOrigin').addEventListener('change', event => {
     initWorkspace(false);
     applyTransforms();
     updatePatternCenterMarker();
+    updateOutputFilenamePreview();
     document.getElementById('generationStatus').textContent = `Workspace origin changed to ${workspaceOriginLabel(nextOrigin)}; artwork placement was preserved.`;
 });
 
 document.getElementById('generationMode').addEventListener('change', () => {
     saveMachineSettings();
     updateGenerationModeVisibility();
+    updateOutputFilenamePreview();
     const mode = document.getElementById('generationMode').value;
     document.getElementById('generationStatus').textContent = mode === 'outline'
         ? 'Outline Trace mode selected. Native SVG paths and shape boundaries will be traced directly.'
@@ -1405,7 +1464,10 @@ document.getElementById('showBrightnessCutoffPreview').addEventListener('change'
 });
 document.getElementById('bestGuessBtn').addEventListener('click', applyBestGuessSettings);
 ['patternLayout', 'waveform'].forEach(id => {
-    document.getElementById(id).addEventListener('change', updatePatternControlVisibility);
+    document.getElementById(id).addEventListener('change', () => {
+        updatePatternControlVisibility();
+        if (id === 'patternLayout') updateOutputFilenamePreview();
+    });
 });
 ['brightnessModulation', 'zMode', 'workspaceOrigin', 'generationMode'].forEach(id => {
     document.getElementById(id).addEventListener('change', () => updateSelectOptionTooltip(id));
@@ -1420,14 +1482,22 @@ document.getElementById('pickPatternCenterBtn').addEventListener('click', () => 
 ['brightnessCutoff', 'densityFudge'].forEach(id => {
     document.getElementById(id).addEventListener('input', () => scheduleBrightnessCutoffPreview());
 });
-COLLAPSIBLE_SECTION_IDS.forEach(id => {
+SIDEBAR_SECTION_IDS.forEach(id => {
     const section = document.getElementById(id);
     if (!section) return;
     section.addEventListener('toggle', () => {
-        saveUiSettings();
-        if (id === 'gcodeSection') window.setTimeout(() => initWorkspace(false), 0);
+        if (accordionSyncing) return;
+        if (section.open) openSidebarSection(id);
+        else saveUiSettings();
     });
 });
+const gcodeSection = document.getElementById('gcodeSection');
+if (gcodeSection) {
+    gcodeSection.addEventListener('toggle', () => {
+        saveUiSettings();
+        window.setTimeout(() => initWorkspace(false), 0);
+    });
+}
 document.getElementById('zoomOutBtn').addEventListener('click', () => setCanvasZoomPercent(canvasZoomPercent / 1.25));
 document.getElementById('zoomInBtn').addEventListener('click', () => setCanvasZoomPercent(canvasZoomPercent * 1.25));
 document.getElementById('zoomFitBtn').addEventListener('click', () => {
@@ -1442,8 +1512,30 @@ document.getElementById('canvas').addEventListener('wheel', event => {
     const factor = event.deltaY < 0 ? 1.12 : (1 / 1.12);
     setCanvasZoomPercent(canvasZoomPercent * factor, anchor);
 }, { passive: false });
-document.getElementById('canvas').addEventListener('pointerdown', event => {
-    if (!pickingPatternCenter) return;
+const toolpathCanvas = document.getElementById('canvas');
+
+function endCanvasPan(event = null) {
+    if (!canvasPanState) return;
+    if (event && toolpathCanvas.hasPointerCapture?.(event.pointerId)) {
+        toolpathCanvas.releasePointerCapture(event.pointerId);
+    }
+    canvasPanState = null;
+    toolpathCanvas.classList.remove('is-panning');
+}
+
+toolpathCanvas.addEventListener('pointerdown', event => {
+    const startsPan = event.button === 1 || (event.button === 0 && event.ctrlKey);
+    if (startsPan) {
+        event.preventDefault();
+        event.stopPropagation();
+        setPatternCenterPicking(false);
+        canvasPanState = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY };
+        toolpathCanvas.setPointerCapture?.(event.pointerId);
+        toolpathCanvas.classList.add('is-panning');
+        return;
+    }
+
+    if (!pickingPatternCenter || event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     const rect = event.currentTarget.getBoundingClientRect();
@@ -1461,6 +1553,25 @@ document.getElementById('canvas').addEventListener('pointerdown', event => {
     setPatternCenterPicking(false);
     document.getElementById('generationStatus').textContent = `Pattern center pinned at X${formatNumber(workspacePoint.x, 2)}, Y${formatNumber(workspacePoint.y, 2)} mm from the ${workspaceOriginLabel()} origin.`;
 });
+
+toolpathCanvas.addEventListener('pointermove', event => {
+    if (!canvasPanState || canvasPanState.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const deltaX = event.clientX - canvasPanState.clientX;
+    const deltaY = event.clientY - canvasPanState.clientY;
+    canvasPanState.clientX = event.clientX;
+    canvasPanState.clientY = event.clientY;
+    const projectDelta = new paper.Point(deltaX, deltaY).divide(Math.max(paper.view.zoom, 0.000001));
+    paper.view.center = paper.view.center.subtract(projectDelta);
+});
+
+toolpathCanvas.addEventListener('pointerup', endCanvasPan);
+toolpathCanvas.addEventListener('pointercancel', endCanvasPan);
+toolpathCanvas.addEventListener('lostpointercapture', () => endCanvasPan());
+toolpathCanvas.addEventListener('auxclick', event => {
+    if (event.button === 1) event.preventDefault();
+});
+
 document.addEventListener('keydown', event => {
     if (event.key === 'Escape' && pickingPatternCenter) {
         setPatternCenterPicking(false);
@@ -1468,6 +1579,22 @@ document.addEventListener('keydown', event => {
     }
 });
 renderLayerControls();
+updateArtworkWorkflowUi();
+updateMachiningEstimateUi();
+updateOutputFilenamePreview();
+
+document.getElementById('machineContinueBtn')?.addEventListener('click', () => {
+    markMachineSetupConfigured();
+    saveMachineSettings();
+    openSidebarSection('importSection');
+});
+document.getElementById('artworkContinueBtn')?.addEventListener('click', () => {
+    if (!originalSVGText) return;
+    openSidebarSection('generateSection');
+});
+MACHINE_SETUP_FIELD_IDS.forEach(id => {
+    document.getElementById(id)?.addEventListener('change', markMachineSetupConfigured);
+});
 
 // --- FILE UPLOAD AND CONVERTER TRANSFER ---
 async function loadSvgText(svgText, filename = 'uploaded.svg', sourceLabel = 'Uploaded') {
@@ -1507,6 +1634,7 @@ async function loadSvgText(svgText, filename = 'uploaded.svg', sourceLabel = 'Up
         if (!prompted) {
             generationStatus.textContent = `${sourceLabel} ${currentSourceFilename} at ${formatNumber(sourceSvgSizeMm.width)} × ${formatNumber(sourceSvgSizeMm.height)} mm.`;
         }
+        updateArtworkWorkflowUi();
     } finally {
         URL.revokeObjectURL(temporaryUrl);
     }
@@ -1521,6 +1649,7 @@ document.getElementById('svgInput').addEventListener('change', async function(ev
         originalSVGImage = null;
         originalSVGText = '';
         sourceSvgSizeMm = null;
+        updateArtworkWorkflowUi();
         generationStatus.textContent = error.message;
         alert(error.message);
     }
@@ -1557,8 +1686,7 @@ async function applyConvertedSvgRecord(record, requestedMode) {
     const modeSelect = document.getElementById('generationMode');
     modeSelect.value = selectedMode;
     modeSelect.dispatchEvent(new Event('change', { bubbles: true }));
-    document.getElementById('importSection')?.setAttribute('open', '');
-    document.getElementById('generateSection')?.setAttribute('open', '');
+    openSidebarSection('importSection');
     const modeLabel = modeSelect.options[modeSelect.selectedIndex]?.textContent || selectedMode;
     generationStatus.textContent = `Received ${filename} and selected ${modeLabel}.`;
 }
@@ -1716,6 +1844,22 @@ function formatDuration(seconds) {
     return `${hours}h ${minutes % 60}m`;
 }
 
+function updateMachiningEstimateUi(stats = null) {
+    latestMachiningEstimate = stats || null;
+    const seconds = Number(stats?.estimated_machining_time_seconds);
+    const formatted = stats?.estimated_machining_time || (Number.isFinite(seconds) ? formatDuration(seconds) : null);
+    const badge = document.getElementById('machiningTimeBadge');
+    const output = document.getElementById('outputTimeEstimate');
+    const text = formatted ? `Estimated time: ${formatted}` : 'Estimated time: —';
+    if (badge) badge.textContent = formatted ? `Time: ${formatted}` : 'Time: —';
+    if (output) output.textContent = text;
+    if (badge && stats) {
+        badge.title = `${Number(stats.draw_distance_mm || 0).toFixed(1)} mm drawing + ${Number(stats.travel_distance_mm || 0).toFixed(1)} mm travel at the configured XY feed; 0.5 seconds per pen-up or pen-down action.`;
+    } else if (badge) {
+        badge.removeAttribute('title');
+    }
+}
+
 function setLoading(message, percent = null, details = '') {
     loadingMessage.textContent = message;
     if (percent !== null && percent !== undefined && Number.isFinite(Number(percent))) {
@@ -1845,6 +1989,58 @@ function currentGcodeSettings() {
     };
 }
 
+const OUTPUT_ORIGIN_CODES = {
+    'top-left': 'TL',
+    'top-right': 'TR',
+    'bottom-left': 'BL',
+    'bottom-right': 'BR'
+};
+const OUTPUT_GENERATION_CODES = {
+    outline: 'OUTLINE',
+    hatch: 'HATCH',
+    'outline-hatch': 'OTH'
+};
+const OUTPUT_LAYOUT_LABELS = {
+    linear: 'Linear',
+    spiral: 'Spiral',
+    concentric: 'Concentric',
+    radial: 'Radial'
+};
+
+function outputSourceStem(filename = currentSourceFilename) {
+    const sourceStem = String(filename || 'hatchplot').replace(/\.[^.]+$/, '');
+    return sourceStem
+        .replace(/[^a-zA-Z0-9_-]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^[-_]+|[-_]+$/g, '')
+        .slice(0, 8) || 'hatchplt';
+}
+
+function suggestedOutputFilename(settings = currentGcodeSettings()) {
+    const generationMode = settings.generationMode || 'hatch';
+    const parts = [
+        outputSourceStem(settings.sourceFilename),
+        OUTPUT_ORIGIN_CODES[settings.workspaceOrigin] || 'TL',
+        OUTPUT_GENERATION_CODES[generationMode] || String(generationMode).toUpperCase()
+    ];
+    if (generationModeUsesHatch(generationMode) && settings.patternLayout) {
+        const layout = String(settings.patternLayout).toLowerCase();
+        parts.push(OUTPUT_LAYOUT_LABELS[layout] || `${layout.charAt(0).toUpperCase()}${layout.slice(1)}`);
+    }
+    return `${parts.join('-')}.nc`;
+}
+
+function updateOutputFilenamePreview(explicitFilename = null) {
+    if (explicitFilename) generatedOutputFilename = explicitFilename;
+    const filename = generatedOutputFilename || suggestedOutputFilename();
+    const preview = document.getElementById('outputFilenamePreview');
+    if (preview) {
+        preview.textContent = filename;
+        preview.title = filename;
+    }
+    return filename;
+}
+
 const GCODE_MAX_LINE_LENGTH = 64;
 
 function gcodeCommentValue(value) {
@@ -1900,6 +2096,7 @@ function buildGcodeHeader(settings, pathCount = null) {
     const toolpathCount = Number.isInteger(pathCount) ? String(pathCount) : 'live preview';
     const comments = [
         'HatchPlot generated G-code',
+        `Output file: ${suggestedOutputFilename(settings)}`,
         `Source SVG: ${gcodeCommentValue(settings.sourceFilename)}`,
         `Enabled layers: ${layers}`,
         `Machine bed: ${gcodeFixed(settings.bedX)} x ${gcodeFixed(settings.bedY)} mm`,
@@ -2227,6 +2424,8 @@ function displayGeneratedResult(data) {
     }
 
     const stats = data.stats || {};
+    updateMachiningEstimateUi(stats);
+    updateOutputFilenamePreview(stats.output_filename || null);
     generationStatus.textContent = [
         `${Number(stats.continuous_paths || stats.outline_paths || stats.hatch_paths || data.paths.length).toLocaleString()} continuous paths`,
         stats.generation_mode ? `${stats.generation_mode} mode` : null,
@@ -2244,12 +2443,14 @@ function displayGeneratedResult(data) {
         stats.row_pitch_mm ? `${formatNumber(Number(stats.row_pitch_mm), 3)} mm row pitch` : null,
         stats.sample_step_mm ? `${formatNumber(Number(stats.sample_step_mm), 3)} mm sample step` : null,
         stats.compute_backend === 'cuda' ? 'CUDA GPU sampling' : stats.compute_backend ? `${stats.compute_backend} compute` : null,
+        stats.estimated_machining_time ? `${stats.estimated_machining_time} estimated machining` : null,
         stats.duration_seconds !== undefined ? `${stats.duration_seconds}s backend time` : null
     ].filter(Boolean).join(' · ');
 }
 
 generateButton.addEventListener('click', async function() {
     if (activeJobId) return;
+    openSidebarSection('generateSection');
     const fileInput = document.getElementById('svgInput');
     if (!originalSVGText) {
         alert('Please upload an SVG or send one from the Image to SVG page.');
@@ -2358,16 +2559,13 @@ function exportGcode() {
     const content = gcodeOutput.value.trim();
     if (!content || activeJobId) return;
 
-    const sourceName = currentSourceFilename || 'hatchplot';
-    const baseName = sourceName
-        .replace(/\.[^.]+$/, '')
-        .replace(/[^a-zA-Z0-9._-]+/g, '-')
-        .replace(/^-+|-+$/g, '') || 'hatchplot';
-    const blob = new Blob([`${content}\n`], { type: 'text/plain;charset=utf-8' });
+    const filename = generatedOutputFilename || updateOutputFilenamePreview();
+    const blob = new Blob([`${content}
+`], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `${baseName}-hatchplot.gcode`;
+    anchor.download = filename;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();

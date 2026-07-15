@@ -53,6 +53,7 @@ MAX_LIVE_PREVIEW_POINTS = int(os.getenv("MAX_LIVE_PREVIEW_POINTS", "20000"))
 LIVE_PREVIEW_CHUNK_POINTS = int(os.getenv("LIVE_PREVIEW_CHUNK_POINTS", "1600"))
 DEFAULT_BRIGHTNESS_CUTOFF = float(os.getenv("DEFAULT_BRIGHTNESS_CUTOFF", "0.025"))
 GCODE_MAX_LINE_LENGTH = 64
+PEN_ACTION_DELAY_SECONDS = 0.5
 MAX_RETAINED_RESULTS = max(1, int(os.getenv("MAX_RETAINED_RESULTS", "4")))
 MAX_PENDING_JOBS = int(os.getenv("MAX_PENDING_JOBS", "4"))
 JOB_WORKERS = max(1, int(os.getenv("JOB_WORKERS", "1")))
@@ -1509,7 +1510,106 @@ def _workspace_output_point(x: float, y: float, params: dict[str, Any]) -> tuple
     return output_x, output_y
 
 
-def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
+def _clean_output_stem(filename: Any) -> str:
+    source_name = os.path.splitext(os.path.basename(str(filename or "hatchplot")))[0]
+    cleaned = "".join(
+        character
+        if ((character.isascii() and character.isalnum()) or character in "-_")
+        else "-"
+        for character in source_name
+    )
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned.strip("-_")[:8] or "hatchplt"
+
+
+def _suggest_output_filename(params: dict[str, Any]) -> str:
+    origin_codes = {
+        "top-left": "TL",
+        "top-right": "TR",
+        "bottom-left": "BL",
+        "bottom-right": "BR",
+    }
+    generation_codes = {
+        "outline": "OUTLINE",
+        "hatch": "HATCH",
+        "outline-hatch": "OTH",
+    }
+    layout_labels = {
+        "linear": "Linear",
+        "spiral": "Spiral",
+        "concentric": "Concentric",
+        "radial": "Radial",
+    }
+    generation_mode = str(params.get("generationMode", "hatch"))
+    parts = [
+        _clean_output_stem(params.get("sourceFilename", "hatchplot.svg")),
+        origin_codes.get(str(params.get("workspaceOrigin", "top-left")), "TL"),
+        generation_codes.get(generation_mode, generation_mode.upper() or "HATCH"),
+    ]
+    if generation_mode in {"hatch", "outline-hatch"}:
+        layout = str(params.get("patternLayout", "")).strip().lower()
+        if layout:
+            parts.append(layout_labels.get(layout, layout[:1].upper() + layout[1:]))
+    return "-".join(parts) + ".nc"
+
+
+def _format_machining_duration(seconds: float) -> str:
+    rounded_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(rounded_seconds, 3600)
+    minutes, seconds_part = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds_part}s"
+    if minutes:
+        return f"{minutes}m {seconds_part}s"
+    return f"{seconds_part}s"
+
+
+def _estimate_machining_time(paths: list[list[list[float]]], params: dict[str, Any]) -> dict[str, Any]:
+    feed_rate_mm_min = max(1.0, float(params.get("xyFeedRate", 2000)))
+    current_x = 0.0
+    current_y = 0.0
+    draw_distance = 0.0
+    travel_distance = 0.0
+    toolpath_count = 0
+
+    for path in paths:
+        if not path:
+            continue
+        first_x, first_y = _workspace_output_point(float(path[0][0]), float(path[0][1]), params)
+        travel_distance += math.hypot(first_x - current_x, first_y - current_y)
+        previous_x, previous_y = first_x, first_y
+        for x, y in path[1:]:
+            output_x, output_y = _workspace_output_point(float(x), float(y), params)
+            draw_distance += math.hypot(output_x - previous_x, output_y - previous_y)
+            previous_x, previous_y = output_x, output_y
+        current_x, current_y = previous_x, previous_y
+        toolpath_count += 1
+
+    if toolpath_count:
+        travel_distance += math.hypot(current_x, current_y)
+
+    xy_motion_seconds = ((draw_distance + travel_distance) / feed_rate_mm_min) * 60.0
+    pen_action_count = toolpath_count * 2
+    pen_delay_seconds = pen_action_count * PEN_ACTION_DELAY_SECONDS
+    total_seconds = xy_motion_seconds + pen_delay_seconds
+    return {
+        "estimated_machining_time_seconds": round(total_seconds, 1),
+        "estimated_machining_time": _format_machining_duration(total_seconds),
+        "estimated_xy_motion_seconds": round(xy_motion_seconds, 1),
+        "estimated_pen_delay_seconds": round(pen_delay_seconds, 1),
+        "pen_action_delay_seconds": PEN_ACTION_DELAY_SECONDS,
+        "pen_action_count": pen_action_count,
+        "draw_distance_mm": round(draw_distance, 2),
+        "travel_distance_mm": round(travel_distance, 2),
+    }
+
+
+def _gcode_preamble(
+    params: dict[str, Any],
+    path_count: int,
+    machining_estimate: dict[str, Any] | None = None,
+) -> list[str]:
     layers = params.get("enabledLayers") or []
     if isinstance(layers, str):
         layers_text = layers
@@ -1527,6 +1627,7 @@ def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
     direction = "clockwise" if bool(params.get("patternClockwise", True)) else "counterclockwise"
     comments = [
         "HatchPlot generated G-code",
+        f"Output file: {_suggest_output_filename(params)}",
         f"Source SVG: {_gcode_comment_value(params.get('sourceFilename', 'uploaded.svg'))}",
         f"Enabled layers: {_gcode_comment_value(layers_text)}",
         f"Machine bed: {float(params['bedX']):.3f} x {float(params['bedY']):.3f} mm",
@@ -1554,6 +1655,18 @@ def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
             "Sequence: native SVG outlines are plotted first, followed "
             "by brightness-driven hatch paths"
         )
+    if machining_estimate:
+        comments.append(
+            "Estimated machining time: "
+            f"{machining_estimate['estimated_machining_time']} "
+            f"(XY at {int(float(params.get('xyFeedRate', 2000)))} mm/min; "
+            f"{PEN_ACTION_DELAY_SECONDS:.1f}s per pen action)"
+        )
+        comments.append(
+            "Estimated motion: "
+            f"{float(machining_estimate['draw_distance_mm']):.2f} mm drawing; "
+            f"{float(machining_estimate['travel_distance_mm']):.2f} mm pen-up travel"
+        )
     comments.extend([
         f"Toolpaths: {path_count}",
         "End HatchPlot header",
@@ -1568,14 +1681,20 @@ def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
     return lines
 
 
-def _compile_gcode(paths: list[list[list[float]]], params: dict[str, Any]) -> list[str]:
+def _compile_gcode(
+    paths: list[list[list[float]]],
+    params: dict[str, Any],
+    machining_estimate: dict[str, Any] | None = None,
+) -> list[str]:
     z_mode = str(params["zMode"])
     z_up = str(params["zUp"])
     z_down = str(params["zDown"])
     xy_feed_rate = int(params["xyFeedRate"])
     z_plunge_rate = int(params["zPlungeRate"])
 
-    gcode = _gcode_preamble(params, len(paths))
+    if machining_estimate is None:
+        machining_estimate = _estimate_machining_time(paths, params)
+    gcode = _gcode_preamble(params, len(paths), machining_estimate)
     for path in paths:
         first_x, first_y = _workspace_output_point(float(path[0][0]), float(path[0][1]), params)
         gcode.append(f"G0 X{first_x:.2f} Y{first_y:.2f}")
@@ -1660,9 +1779,12 @@ def generate_toolpath(
             compute_backend=raster_stats.get("compute_backend"),
         )
         _check_cancel_requested(progress)
-        gcode = _compile_gcode(compiled_paths, params)
+        machining_estimate = _estimate_machining_time(compiled_paths, params)
+        gcode = _compile_gcode(compiled_paths, params, machining_estimate)
         duration = time.perf_counter() - started
         combined_stats = {
+            **machining_estimate,
+            "output_filename": _suggest_output_filename(params),
             **raster_stats,
             "duration_seconds": round(duration, 3),
             "drawable_elements": outline_stats.get("drawable_elements"),
@@ -1671,7 +1793,7 @@ def generate_toolpath(
             "continuous_paths": len(compiled_paths),
             "toolpath_points": toolpath_points,
             "gcode_lines": len(gcode),
-            "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
+            "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths), machining_estimate)),
             "pen_thickness_mm": float(params.get("penThickness", 0.5)),
             "generation_mode": "outline-hatch",
             "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
@@ -1713,20 +1835,23 @@ def generate_toolpath(
             compute_backend=raster_stats.get("compute_backend"),
         )
         _check_cancel_requested(progress)
-        gcode = _compile_gcode(compiled_paths, params)
+        machining_estimate = _estimate_machining_time(compiled_paths, params)
+        gcode = _compile_gcode(compiled_paths, params, machining_estimate)
         duration = time.perf_counter() - started
         toolpath_points = sum(len(path) for path in compiled_paths)
         result = {
             "gcode": "\n".join(gcode),
             "paths": compiled_paths,
             "stats": {
+                **machining_estimate,
+                "output_filename": _suggest_output_filename(params),
                 "duration_seconds": round(duration, 3),
                 "drawable_elements": None,
                 "hatch_paths": len(compiled_paths),
                 "continuous_paths": len(compiled_paths),
                 "toolpath_points": toolpath_points,
                 "gcode_lines": len(gcode),
-                "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
+                "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths), machining_estimate)),
                 "pen_thickness_mm": float(params.get("penThickness", 0.5)),
                 **raster_stats,
             },
@@ -1957,10 +2082,13 @@ def generate_toolpath(
         compute_backend="geos-cpu",
     )
     _check_cancel_requested(progress)
-    gcode = _compile_gcode(compiled_paths, params)
+    machining_estimate = _estimate_machining_time(compiled_paths, params)
+    gcode = _compile_gcode(compiled_paths, params, machining_estimate)
 
     duration = time.perf_counter() - started
     stats: dict[str, Any] = {
+        **machining_estimate,
+        "output_filename": _suggest_output_filename(params),
         "duration_seconds": round(duration, 3),
         "drawable_elements": drawable_elements,
         "hatch_paths": len(compiled_paths) if generation_mode == "hatch" else 0,
@@ -1970,7 +2098,7 @@ def generate_toolpath(
         "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
         "toolpath_points": toolpath_points,
         "gcode_lines": len(gcode),
-        "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
+        "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths), machining_estimate)),
         "scale_mode": scale_mode,
         "scale_percent": float(params["svgScale"]),
         "source_width": round(source_width_mm if generation_mode == "outline" and source_width_mm > 0.0 else svg_width, 4),

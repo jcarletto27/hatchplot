@@ -74,19 +74,33 @@
         }
         .brand-copy h1 { margin: 0; font-size: 1.04rem; letter-spacing: 0.02em; }
         .brand-copy p { margin: 3px 0 0; color: var(--muted); font-size: 0.78rem; }
-        .brand-link {
-            margin-left: auto;
-            padding: 7px 10px;
-            border: 1px solid var(--border-strong);
-            border-radius: 9px;
-            color: var(--text);
-            background: var(--panel-soft);
+        .workspace-switch {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px;
+            margin: 0 0 16px;
+            padding: 4px;
+            border: 1px solid var(--border);
+            border-radius: 11px;
+            background: rgba(8, 13, 21, 0.66);
+        }
+        .workspace-switch a {
+            min-width: 0;
+            padding: 8px 9px;
+            border-radius: 8px;
+            color: var(--muted);
             font-size: 0.72rem;
-            font-weight: 700;
+            font-weight: 760;
+            text-align: center;
             text-decoration: none;
             white-space: nowrap;
         }
-        .brand-link:hover { border-color: var(--accent); color: var(--accent); }
+        .workspace-switch a:hover { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+        .workspace-switch a[aria-current="page"] {
+            color: #07130f;
+            background: linear-gradient(135deg, #75ead3, #5eb9ff);
+            box-shadow: 0 5px 14px rgba(85, 214, 190, 0.16);
+        }
 
         .section {
             margin: 0 0 14px;
@@ -101,8 +115,8 @@
             display: flex;
             align-items: center;
             gap: 11px;
-            min-height: 62px;
-            padding: 12px 15px;
+            min-height: 54px;
+            padding: 10px 13px;
             cursor: pointer;
             list-style: none;
             user-select: none;
@@ -127,7 +141,7 @@
         .section-subtitle { display: block; margin-top: 2px; color: var(--muted); font-size: 0.7rem; font-weight: 500; }
         .chevron { color: var(--muted); transition: transform 0.18s ease; }
         .section[open] .chevron { transform: rotate(180deg); }
-        .section-body { padding: 4px 15px 16px; border-top: 1px solid rgba(148, 163, 184, 0.10); }
+        .section-body { padding: 3px 13px 14px; border-top: 1px solid rgba(148, 163, 184, 0.10); }
 
         .form-group { margin: 12px 0 0; }
         .flex-row { display: flex; gap: 10px; }
@@ -252,6 +266,25 @@
             font-size: 0.73rem;
             line-height: 1.45;
         }
+        .workflow-footer {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            align-items: center;
+            gap: 10px;
+            margin-top: 14px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(148, 163, 184, 0.12);
+        }
+        .workflow-footer .status { margin: 0; }
+        .workflow-footer button { width: auto; min-width: 132px; margin: 0; }
+        .workspace-badges { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+        .workspace-badge.subtle { max-width: 240px; overflow: hidden; text-overflow: ellipsis; color: var(--muted); background: rgba(27, 37, 53, 0.74); }
+        .workspace-badge.time { color: #c7f7de; border-color: rgba(96, 211, 148, 0.28); background: rgba(96, 211, 148, 0.08); }
+        .canvas-pan-hint { color: var(--muted); font-size: 0.68rem; white-space: nowrap; }
+        canvas.is-panning { cursor: grabbing !important; }
+        .output-meta { display: flex; min-width: 0; align-items: center; gap: 10px; color: var(--muted); font-size: 0.72rem; }
+        .output-filename { max-width: min(420px, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: "SFMono-Regular", Consolas, monospace; color: #cde6ff; }
+        .output-actions { flex-wrap: wrap; }
         #layerControls .checkbox-row { margin: 5px 0; padding: 8px 9px; background: rgba(8, 13, 21, 0.34); }
 
         .main-panel {
@@ -298,6 +331,7 @@
         .canvas-toolbar {
             display: flex;
             align-items: center;
+            flex-wrap: wrap;
             gap: 8px;
             min-height: 44px;
             padding: 0 2px 10px;
@@ -402,7 +436,9 @@
         .line-count { color: var(--muted); font-weight: 600; }
         .output-actions {
             display: flex;
-            justify-content: flex-end;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
             padding: 10px 12px 0;
         }
         .output-actions button { width: auto; min-height: 34px; margin: 0; padding: 6px 12px; }
@@ -478,6 +514,9 @@
             .sidebar, .main-panel { padding: 12px; }
             .flex-row { flex-direction: column; gap: 0; }
             .canvas-toolbar input[type="range"] { width: 120px; }
+            .canvas-pan-hint { width: 100%; order: 2; }
+            .output-meta { width: 100%; justify-content: space-between; }
+            .output-actions { align-items: stretch; }
             .workspace-badge { display: none; }
         }
     </style>
@@ -489,10 +528,13 @@
             <div class="brand-mark">HP</div>
             <div class="brand-copy">
                 <h1>HatchPlot</h1>
-                <p>Brightness-driven SVG toolpaths</p>
+                <p>Plotter-ready vector workflows</p>
             </div>
-            <a class="brand-link" href="/converter.html">Image to SVG</a>
         </header>
+        <nav class="workspace-switch" aria-label="HatchPlot workspace">
+            <a href="./" aria-current="page">Toolpath</a>
+            <a href="./converter.html">Image Conversion</a>
+        </nav>
 
         <details class="section" id="machineSection" open>
             <summary>
@@ -532,11 +574,14 @@
                     <div class="form-group"><label for="xyFeedRate">XY feed (mm/min)</label><input type="number" id="xyFeedRate" name="xyFeedRate" value="2000"></div>
                     <div class="form-group"><label for="zPlungeRate">Z plunge (mm/min)</label><input type="number" id="zPlungeRate" name="zPlungeRate" value="300"></div>
                 </div>
-                <div id="machineSettingsStatus" class="status">Changes are saved automatically.</div>
+                <div class="workflow-footer">
+                    <div id="machineSettingsStatus" class="status">Changes are saved automatically.</div>
+                    <button type="button" id="machineContinueBtn" class="secondary-btn">Continue</button>
+                </div>
             </div>
         </details>
 
-        <details class="section" id="importSection" open>
+        <details class="section" id="importSection">
             <summary>
                 <span class="section-number">2</span>
                 <span class="section-heading">
@@ -571,10 +616,14 @@
                     </div>
                     <div id="layerControls" class="status">Upload an SVG to inspect its layers.</div>
                 </div>
+                <div class="workflow-footer">
+                    <div id="artworkWorkflowStatus" class="status">Load and position artwork before generating.</div>
+                    <button type="button" id="artworkContinueBtn" class="secondary-btn" disabled>Continue</button>
+                </div>
             </div>
         </details>
 
-        <details class="section" id="generateSection" open>
+        <details class="section" id="generateSection">
             <summary>
                 <span class="section-number">3</span>
                 <span class="section-heading">
@@ -726,9 +775,13 @@
         <header class="workspace-header">
             <div class="workspace-title">
                 <h2>Toolpath Workspace</h2>
-                <p>Zoom in for detail; use Fit to return to the full machine bed.</p>
+                <p>Place artwork, generate a toolpath, verify the estimate, then export.</p>
             </div>
-            <div class="workspace-badge" id="workspaceOriginBadge">Origin: top-left</div>
+            <div class="workspace-badges">
+                <div class="workspace-badge subtle" id="sourceFileBadge">No SVG loaded</div>
+                <div class="workspace-badge time" id="machiningTimeBadge">Time: —</div>
+                <div class="workspace-badge" id="workspaceOriginBadge">Origin: top-left</div>
+            </div>
         </header>
 
         <section class="canvas-card">
@@ -738,6 +791,7 @@
                 <button type="button" id="zoomInBtn" class="secondary-btn" title="Zoom in">+</button>
                 <input type="range" id="zoomSlider" min="25" max="800" step="5" value="100" aria-label="Canvas zoom percentage">
                 <span id="zoomLabel">100%</span>
+                <span class="canvas-pan-hint">Pan: middle-drag or Ctrl+drag</span>
                 <span class="toolbar-spacer"></span>
                 <label class="toolbar-toggle" for="hideSourceSvg">
                     <input type="checkbox" id="hideSourceSvg">
@@ -756,7 +810,11 @@
                 <span class="chevron">⌄</span>
             </summary>
             <div class="output-actions">
-                <button type="button" id="exportGcodeBtn" class="secondary-btn" disabled>Export G-code</button>
+                <div class="output-meta">
+                    <span id="outputFilenamePreview" class="output-filename">hatchplt-TL-HATCH-Linear.nc</span>
+                    <span id="outputTimeEstimate">Estimated time: —</span>
+                </div>
+                <button type="button" id="exportGcodeBtn" class="secondary-btn" disabled>Export .nc</button>
             </div>
             <textarea id="gcodeOutput" readonly spellcheck="false" placeholder="Generated G-code appears here. The currently executing line is highlighted during simulation."></textarea>
         </details>
