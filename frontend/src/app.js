@@ -6,6 +6,7 @@ let workingSVG = null;
 let originalSVGImage = null;
 let originalSVGObjectUrl = null;
 let originalSVGText = '';
+let currentSourceFilename = 'uploaded.svg';
 let sourceSvgSizeMm = null;
 let originalSvgDocument = null;
 let layerEntries = [];
@@ -37,6 +38,9 @@ let lastWorkspaceOrigin = 'top-left';
 
 const MACHINE_SETTINGS_KEY = 'hatchPlotter.machineSettings.v1';
 const UI_SETTINGS_KEY = 'hatchPlotter.uiSettings.v1';
+const SVG_TRANSFER_DB = 'hatchplot-artwork-transfer-v1';
+const SVG_TRANSFER_STORE = 'pending-artwork';
+const SVG_TRANSFER_KEY = 'pending';
 const FIT_MARGIN = 0.9;
 const MM_PER_CSS_PIXEL = 25.4 / 96;
 const MAX_BRIGHTNESS_MAP_DIMENSION = 4096;
@@ -82,7 +86,7 @@ const GENERATION_FIELD_TOOLTIPS = {
     penThickness: 'Physical pen-tip width. It sets the minimum useful carrier step-over and preview stroke width; an accurate value helps avoid redundant, muddy lines.',
     densityFudge: 'Biases sampled darkness before density gating. Positive values retain more carriers for a darker result; negative values suppress carriers for a lighter, cleaner result.',
     brightnessCutoff: 'Minimum adjusted darkness required to draw. Raising it removes more pale gray detail and noise; lowering it preserves fainter tones.',
-    generationMode: 'Brightness Hatch converts grayscale into density-modulated carriers. Outline Trace follows native SVG vector paths: strokes use their centerlines and filled shapes use their vector boundaries.',
+    generationMode: 'Brightness Hatch converts grayscale into density-modulated carriers. Outline Trace follows native SVG vectors. Outline then Hatch plots those vectors first and then adds the selected grayscale hatch.',
     patternLayout: 'Selects the base carrier geometry used to traverse the brightness map. Hover the help icon after choosing a layout for a description of that layout.',
     waveform: 'Selects the shape displaced around each base carrier. Hover the help icon after choosing a waveform for a description of that waveform.',
     patternSpacing: 'Nominal distance between adjacent layout carriers before brightness-based density gating. Smaller spacing captures more detail but creates more lines and G-code.',
@@ -104,7 +108,8 @@ const SELECT_OPTION_TOOLTIPS = {
     },
     generationMode: {
         hatch: 'Creates brightness-driven hatching or waveform carriers. Darker regions retain more lines and lighter regions retain fewer.',
-        outline: 'Traces native SVG vector geometry without rasterizing it. Stroked paths follow their centerlines and filled shapes follow their vector boundaries. Pattern, waveform, and brightness controls are ignored.'
+        outline: 'Traces native SVG vector geometry without rasterizing it. Stroked paths follow their centerlines and filled shapes follow their vector boundaries. Pattern, waveform, and brightness controls are ignored.',
+        'outline-hatch': 'Plots native SVG vector outlines first, then plots the brightness-driven hatch paths using the selected layout and waveform.'
     },
     patternLayout: {
         linear: 'Parallel carriers crossing the artwork. This is the most predictable general-purpose layout; Pattern Angle controls their orientation.',
@@ -134,6 +139,14 @@ const SELECT_OPTION_TOOLTIPS = {
 function readPositiveNumber(id, fallback) {
     const value = Number.parseFloat(document.getElementById(id).value);
     return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function generationModeUsesHatch(mode = document.getElementById('generationMode')?.value) {
+    return mode === 'hatch' || mode === 'outline-hatch';
+}
+
+function generationModeUsesOutline(mode = document.getElementById('generationMode')?.value) {
+    return mode === 'outline' || mode === 'outline-hatch';
 }
 
 function formatNumber(value, maximumFractionDigits = 2) {
@@ -392,7 +405,7 @@ function serializeEnabledSvg() {
 
 function serializeSvgForGeneration(generationMode) {
     const svgText = serializeEnabledSvg();
-    if (generationMode !== 'outline' || !sourceSvgSizeMm) return svgText;
+    if (!generationModeUsesOutline(generationMode) || !sourceSvgSizeMm) return svgText;
     try {
         const documentNode = new DOMParser().parseFromString(svgText, 'image/svg+xml');
         const root = documentNode.documentElement;
@@ -571,7 +584,7 @@ function scheduleBrightnessCutoffPreview(delay = 120) {
 }
 
 async function refreshBrightnessCutoffPreview() {
-    if (document.getElementById('generationMode').value !== 'hatch') {
+    if (!generationModeUsesHatch()) {
         clearBrightnessCutoffPreview('Brightness cutoff is not used in Outline Trace mode.');
         return;
     }
@@ -1040,7 +1053,7 @@ function updatePatternCenterMarker() {
         strokeColor: '#5f4300',
         strokeWidth: 0.5
     }));
-    patternCenterMarker.visible = document.getElementById('generationMode').value === 'hatch';
+    patternCenterMarker.visible = generationModeUsesHatch();
     patternCenterMarker.bringToFront();
 }
 
@@ -1128,13 +1141,20 @@ function updateGenerationModeVisibility() {
     const mode = document.getElementById('generationMode').value;
     const hatchControls = document.getElementById('hatchModeControls');
     const outlineHelp = document.getElementById('outlineModeHelp');
+    const outlineHatchHelp = document.getElementById('outlineHatchModeHelp');
     const generateButton = document.getElementById('generateBtn');
-    const isOutline = mode === 'outline';
-    if (hatchControls) hatchControls.hidden = isOutline;
-    if (outlineHelp) outlineHelp.hidden = !isOutline;
-    if (generateButton) generateButton.textContent = isOutline ? 'Trace SVG Outlines' : 'Generate Toolpath';
-    if (patternCenterMarker) patternCenterMarker.visible = !isOutline;
-    if (isOutline) {
+    const hatchEnabled = generationModeUsesHatch(mode);
+    const outlineOnly = mode === 'outline';
+    if (hatchControls) hatchControls.hidden = !hatchEnabled;
+    if (outlineHelp) outlineHelp.hidden = !outlineOnly;
+    if (outlineHatchHelp) outlineHatchHelp.hidden = mode !== 'outline-hatch';
+    if (generateButton) {
+        generateButton.textContent = outlineOnly
+            ? 'Trace SVG Outlines'
+            : mode === 'outline-hatch' ? 'Outline then Hatch' : 'Generate Toolpath';
+    }
+    if (patternCenterMarker) patternCenterMarker.visible = hatchEnabled;
+    if (!hatchEnabled) {
         setPatternCenterPicking(false);
         clearBrightnessCutoffPreview('Brightness cutoff is not used in Outline Trace mode.');
     } else {
@@ -1342,9 +1362,12 @@ document.getElementById('workspaceOrigin').addEventListener('change', event => {
 document.getElementById('generationMode').addEventListener('change', () => {
     saveMachineSettings();
     updateGenerationModeVisibility();
-    document.getElementById('generationStatus').textContent = document.getElementById('generationMode').value === 'outline'
+    const mode = document.getElementById('generationMode').value;
+    document.getElementById('generationStatus').textContent = mode === 'outline'
         ? 'Outline Trace mode selected. Native SVG paths and shape boundaries will be traced directly.'
-        : 'Brightness Hatch mode selected. Tone controls local line density.';
+        : mode === 'outline-hatch'
+            ? 'Outline then Hatch selected. Vector borders will plot first, followed by brightness-driven hatching.'
+            : 'Brightness Hatch mode selected. Tone controls local line density.';
 });
 
 MACHINE_SETTING_IDS.filter(id => !['bedX', 'bedY', 'workspaceOrigin', 'generationMode'].includes(id)).forEach(id => {
@@ -1444,58 +1467,108 @@ document.addEventListener('keydown', event => {
 });
 renderLayerControls();
 
-// --- FILE UPLOAD ---
-document.getElementById('svgInput').addEventListener('change', function(event) {
+// --- FILE UPLOAD AND CONVERTER TRANSFER ---
+async function loadSvgText(svgText, filename = 'uploaded.svg', sourceLabel = 'Uploaded') {
+    if (originalSVG) originalSVG.remove();
+    if (workingSVG) workingSVG.remove();
+    if (originalSVGObjectUrl) URL.revokeObjectURL(originalSVGObjectUrl);
+    clearGeneratedPreview();
+
+    originalSVGText = String(svgText || '');
+    currentSourceFilename = String(filename || 'uploaded.svg');
+    try {
+        const layerData = detectSvgLayers(originalSVGText);
+        originalSvgDocument = layerData.documentNode;
+        layerEntries = layerData.layers;
+        renderLayerControls();
+    } catch (error) {
+        originalSvgDocument = null;
+        layerEntries = [];
+        originalSVGText = '';
+        renderLayerControls();
+        generationStatus.textContent = error.message;
+        throw error;
+    }
+
+    const temporaryUrl = URL.createObjectURL(new Blob([originalSVGText], { type: 'image/svg+xml' }));
+    const image = new Image();
+    try {
+        await new Promise((resolve, reject) => {
+            image.onload = resolve;
+            image.onerror = () => reject(new Error('The SVG could not be rendered. Check it for invalid XML or inaccessible external images.'));
+            image.src = temporaryUrl;
+        });
+        sourceSvgSizeMm = determineSvgPhysicalSize(originalSVGText, image);
+        if (document.getElementById('autoCenter').checked) setCenterInputs();
+        await reloadPreviewFromLayerSelection(true);
+        const prompted = offerAutoScaleToFit('upload');
+        if (!prompted) {
+            generationStatus.textContent = `${sourceLabel} ${currentSourceFilename} at ${formatNumber(sourceSvgSizeMm.width)} × ${formatNumber(sourceSvgSizeMm.height)} mm.`;
+        }
+    } finally {
+        URL.revokeObjectURL(temporaryUrl);
+    }
+}
+
+document.getElementById('svgInput').addEventListener('change', async function(event) {
     const file = event.target.files[0];
     if (!file) return;
+    try {
+        await loadSvgText(await file.text(), file.name, 'Loaded');
+    } catch (error) {
+        originalSVGImage = null;
+        originalSVGText = '';
+        sourceSvgSizeMm = null;
+        generationStatus.textContent = error.message;
+        alert(error.message);
+    }
+});
 
-    const reader = new FileReader();
-    reader.onload = function(loadEvent) {
-        if (originalSVG) originalSVG.remove();
-        if (workingSVG) workingSVG.remove();
-        if (originalSVGObjectUrl) URL.revokeObjectURL(originalSVGObjectUrl);
-        clearGeneratedPreview();
-
-        originalSVGText = String(loadEvent.target.result || '');
-        try {
-            const layerData = detectSvgLayers(originalSVGText);
-            originalSvgDocument = layerData.documentNode;
-            layerEntries = layerData.layers;
-            renderLayerControls();
-        } catch (error) {
-            originalSvgDocument = null;
-            layerEntries = [];
-            renderLayerControls();
-            generationStatus.textContent = error.message;
-            alert(error.message);
+function openSvgTransferDatabase() {
+    return new Promise((resolve, reject) => {
+        if (!('indexedDB' in window)) {
+            reject(new Error('This browser does not support artwork transfer storage.'));
             return;
         }
-
-        const temporaryUrl = URL.createObjectURL(new Blob([originalSVGText], { type: 'image/svg+xml' }));
-        const image = new Image();
-
-        image.onload = async function() {
-            sourceSvgSizeMm = determineSvgPhysicalSize(originalSVGText, image);
-            if (document.getElementById('autoCenter').checked) setCenterInputs();
-            await reloadPreviewFromLayerSelection(true);
-            const prompted = offerAutoScaleToFit('upload');
-            if (!prompted) {
-                generationStatus.textContent = `Loaded SVG at ${formatNumber(sourceSvgSizeMm.width)} × ${formatNumber(sourceSvgSizeMm.height)} mm.`;
+        const request = indexedDB.open(SVG_TRANSFER_DB, 1);
+        request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains(SVG_TRANSFER_STORE)) {
+                database.createObjectStore(SVG_TRANSFER_STORE);
             }
-            URL.revokeObjectURL(temporaryUrl);
         };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('Unable to open artwork transfer storage.'));
+    });
+}
 
-        image.onerror = function() {
-            URL.revokeObjectURL(temporaryUrl);
-            originalSVGImage = null;
-            sourceSvgSizeMm = null;
-            generationStatus.textContent = 'Unable to render the uploaded SVG in the browser.';
-            alert('The uploaded SVG could not be rendered. Check it for invalid XML or inaccessible external images.');
-        };
-        image.src = temporaryUrl;
-    };
-    reader.readAsText(file);
-});
+async function consumePendingConvertedSvg() {
+    let database;
+    try {
+        database = await openSvgTransferDatabase();
+        const record = await new Promise((resolve, reject) => {
+            const transaction = database.transaction(SVG_TRANSFER_STORE, 'readwrite');
+            const store = transaction.objectStore(SVG_TRANSFER_STORE);
+            const request = store.get(SVG_TRANSFER_KEY);
+            let value = null;
+            request.onsuccess = () => {
+                value = request.result || null;
+                if (value) store.delete(SVG_TRANSFER_KEY);
+            };
+            request.onerror = () => reject(request.error || new Error('Unable to read the transferred SVG.'));
+            transaction.oncomplete = () => resolve(value);
+            transaction.onerror = () => reject(transaction.error || new Error('Unable to clear the transferred SVG.'));
+            transaction.onabort = () => reject(transaction.error || new Error('The transferred SVG could not be consumed.'));
+        });
+        if (!record?.svgText) return;
+        await loadSvgText(record.svgText, record.filename || 'converted-image.svg', 'Received');
+        document.getElementById('importSection')?.setAttribute('open', '');
+    } catch (error) {
+        console.warn('Unable to receive converted artwork:', error);
+    } finally {
+        if (database) database.close();
+    }
+}
 
 // --- SPATIAL TRANSFORMATIONS ---
 ['svgScale', 'svgRotate'].forEach(id => {
@@ -1672,9 +1745,8 @@ function highlightGcodeLine(lineIndex) {
 }
 
 function currentGcodeSettings() {
-    const sourceFile = document.getElementById('svgInput').files[0];
     return {
-        sourceFilename: sourceFile?.name || 'uploaded.svg',
+        sourceFilename: currentSourceFilename || 'uploaded.svg',
         enabledLayers: getEnabledLayerNames(),
         bedX: readPositiveNumber('bedX', 210),
         bedY: readPositiveNumber('bedY', 297),
@@ -1733,14 +1805,18 @@ function buildGcodeHeader(settings, pathCount = null) {
         `; Pen size: ${gcodeFixed(settings.penThickness)} mm`,
         `; SVG transform: scale=${gcodeFixed(settings.svgScale)}% (${gcodeCommentValue(settings.svgScaleMode)}); rotation=${gcodeFixed(settings.svgRotate)} deg; center=(${gcodeFixed(settings.svgPosX)}, ${gcodeFixed(settings.svgPosY)}) mm`,
     ];
-    if (settings.generationMode === 'outline') {
+    if (generationModeUsesOutline(settings.generationMode)) {
         lines.push('; Outline: traces native SVG vector geometry; stroked paths follow their centerlines and filled shapes follow their vector boundaries');
-    } else {
+    }
+    if (generationModeUsesHatch(settings.generationMode)) {
         lines.push(
             `; Brightness: cutoff=${gcodeFixed(settings.brightnessCutoff)}; density fudge=${Number(settings.densityFudge) >= 0 ? '+' : ''}${gcodeFixed(settings.densityFudge)}; modulation=${gcodeCommentValue(settings.brightnessModulation)}`,
             `; Pattern: layout=${gcodeCommentValue(settings.patternLayout)}; spacing=${gcodeFixed(settings.patternSpacing)} mm; angle=${gcodeFixed(settings.patternAngle)} deg; center=(${gcodeFixed(settings.patternCenterX)}, ${gcodeFixed(settings.patternCenterY)}) mm; direction=${direction}`,
             `; Waveform: type=${gcodeCommentValue(settings.waveform)}; amplitude=${gcodeFixed(settings.waveAmplitude)} mm; wavelength=${gcodeFixed(settings.waveLength)} mm`
         );
+    }
+    if (settings.generationMode === 'outline-hatch') {
+        lines.push('; Sequence: native SVG outlines are plotted first, followed by brightness-driven hatch paths');
     }
     lines.push(
         `; Toolpaths: ${toolpathCount}`,
@@ -1879,7 +1955,7 @@ async function buildGenerationFormData(penThickness) {
     let patternSpacing = Number.parseFloat(document.getElementById('patternSpacing').value);
     let waveAmplitude = Number.parseFloat(document.getElementById('waveAmplitude').value);
     let waveLength = Number.parseFloat(document.getElementById('waveLength').value);
-    if (generationMode === 'hatch') {
+    if (generationModeUsesHatch(generationMode)) {
         if (!Number.isFinite(densityFudge) || densityFudge < -0.5 || densityFudge > 0.5) {
             throw new Error('Density fudge must be between -0.5 and 0.5.');
         }
@@ -1897,14 +1973,14 @@ async function buildGenerationFormData(penThickness) {
         waveLength = Number.isFinite(waveLength) && waveLength >= 0.05 ? waveLength : 3;
     }
 
-    const renderedSourceMap = generationMode === 'hatch'
+    const renderedSourceMap = generationModeUsesHatch(generationMode)
         ? await renderBrightnessMap(penThickness)
         : null;
     const svgCenter = getSvgCanvasCenter();
     const patternCenter = getPatternCanvasCenter();
     const formData = new FormData();
     const filteredSvg = new Blob([serializeSvgForGeneration(generationMode)], { type: 'image/svg+xml' });
-    formData.append('file', filteredSvg, fileInput.files[0]?.name || 'filtered.svg');
+    formData.append('file', filteredSvg, currentSourceFilename || fileInput.files[0]?.name || 'filtered.svg');
     if (renderedSourceMap) {
         formData.append('brightnessMap', renderedSourceMap, 'brightness-map.png');
     }
@@ -2058,8 +2134,8 @@ function displayGeneratedResult(data) {
 generateButton.addEventListener('click', async function() {
     if (activeJobId) return;
     const fileInput = document.getElementById('svgInput');
-    if (!fileInput.files.length) {
-        alert('Please upload an SVG.');
+    if (!originalSVGText) {
+        alert('Please upload an SVG or send one from the Image to SVG page.');
         return;
     }
 
@@ -2072,13 +2148,25 @@ generateButton.addEventListener('click', async function() {
         const penThickness = ensurePenThickness();
         const generationMode = document.getElementById('generationMode').value;
         setLoading(
-            generationMode === 'outline' ? 'Preparing SVG vector geometry for outline tracing...' : 'Rendering a brightness map from the transformed SVG...',
+            generationMode === 'outline'
+                ? 'Preparing SVG vector geometry for outline tracing...'
+                : generationMode === 'outline-hatch'
+                    ? 'Preparing native outlines and the transformed brightness map...'
+                    : 'Rendering a brightness map from the transformed SVG...',
             1,
-            generationMode === 'outline' ? 'Keeping original paths and shape boundaries as vectors' : 'Preparing the exact machine-coordinate raster'
+            generationMode === 'outline'
+                ? 'Keeping original paths and shape boundaries as vectors'
+                : generationMode === 'outline-hatch'
+                    ? 'The outline pass will run before the hatch pass'
+                    : 'Preparing the exact machine-coordinate raster'
         );
         const formData = await buildGenerationFormData(penThickness);
         setLoading(
-            generationMode === 'outline' ? 'Uploading SVG and starting vector outline tracing...' : 'Uploading SVG and starting brightness-driven generation...',
+            generationMode === 'outline'
+                ? 'Uploading SVG and starting vector outline tracing...'
+                : generationMode === 'outline-hatch'
+                    ? 'Uploading SVG and starting outline-then-hatch generation...'
+                    : 'Uploading SVG and starting brightness-driven generation...',
             2,
             'Starting the queued backend job'
         );
@@ -2147,7 +2235,7 @@ function exportGcode() {
     const content = gcodeOutput.value.trim();
     if (!content || activeJobId) return;
 
-    const sourceName = document.getElementById('svgInput').files[0]?.name || 'hatchplot';
+    const sourceName = currentSourceFilename || 'hatchplot';
     const baseName = sourceName
         .replace(/\.[^.]+$/, '')
         .replace(/[^a-zA-Z0-9._-]+/g, '-')
@@ -2279,3 +2367,5 @@ paper.view.onFrame = function() {
         highlightGcodeLine(range.moveCount > 0 ? range.moveStartLine + moveIndex : range.penDownLine);
     }
 };
+
+consumePendingConvertedSvg();

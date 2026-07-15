@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image to SVG · HatchPlot</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #0b0f17;
+            --panel: #151d2b;
+            --panel-soft: #1b2535;
+            --border: rgba(148, 163, 184, 0.24);
+            --text: #edf4ff;
+            --muted: #9aa9bd;
+            --accent: #55d6be;
+            --accent-strong: #22bfa3;
+            --danger: #ff6b7a;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            color: var(--text);
+            background:
+                radial-gradient(circle at 10% 0%, rgba(85, 214, 190, 0.10), transparent 31%),
+                radial-gradient(circle at 100% 100%, rgba(103, 167, 255, 0.10), transparent 38%),
+                var(--bg);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        button, input, select { font: inherit; }
+        header {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 18px 24px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(11, 15, 23, 0.84);
+            position: sticky;
+            top: 0;
+            z-index: 5;
+            backdrop-filter: blur(16px);
+        }
+        .mark {
+            width: 42px;
+            height: 42px;
+            display: grid;
+            place-items: center;
+            border-radius: 13px;
+            color: #07130f;
+            background: linear-gradient(145deg, #7af1d8, #4ba9ff);
+            font-weight: 900;
+        }
+        h1 { margin: 0; font-size: 1.08rem; }
+        header p { margin: 2px 0 0; color: var(--muted); font-size: 0.8rem; }
+        .back-link {
+            margin-left: auto;
+            padding: 9px 12px;
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--panel-soft);
+            text-decoration: none;
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+        .back-link:hover { border-color: var(--accent); color: var(--accent); }
+        main {
+            width: min(1440px, calc(100% - 32px));
+            margin: 22px auto 42px;
+            display: grid;
+            grid-template-columns: minmax(300px, 390px) minmax(0, 1fr);
+            gap: 18px;
+        }
+        .panel {
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: rgba(21, 29, 43, 0.94);
+            box-shadow: 0 18px 48px rgba(0, 0, 0, 0.24);
+        }
+        .controls { padding: 18px; align-self: start; }
+        .controls h2, .preview-panel h2 { margin: 0 0 14px; font-size: 0.94rem; }
+        .form-group { margin-bottom: 13px; }
+        label { display: block; margin-bottom: 6px; color: #d9e6f7; font-size: 0.78rem; font-weight: 700; }
+        input, select {
+            width: 100%;
+            min-height: 39px;
+            padding: 8px 10px;
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            background: #0f1622;
+        }
+        input:focus, select:focus { outline: 2px solid rgba(85, 214, 190, 0.35); border-color: var(--accent); }
+        .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .checkbox-row { display: flex; gap: 9px; align-items: flex-start; margin: 11px 0; }
+        .checkbox-row input { width: auto; min-height: 0; margin-top: 3px; }
+        .checkbox-row label { margin: 0; font-weight: 600; line-height: 1.35; }
+        .helper { color: var(--muted); font-size: 0.74rem; line-height: 1.45; }
+        .mode-options[hidden] { display: none; }
+        .buttons { display: grid; gap: 9px; margin-top: 16px; }
+        button {
+            min-height: 41px;
+            padding: 9px 12px;
+            border: 1px solid transparent;
+            border-radius: 10px;
+            color: #07130f;
+            background: var(--accent);
+            font-weight: 800;
+            cursor: pointer;
+        }
+        button:hover:not(:disabled) { background: #7ae6d1; }
+        button.secondary { color: var(--text); background: var(--panel-soft); border-color: var(--border); }
+        button.secondary:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--panel-soft); }
+        button:disabled { opacity: 0.46; cursor: not-allowed; }
+        .status {
+            min-height: 44px;
+            margin-top: 14px;
+            padding: 10px 11px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--muted);
+            background: #0f1622;
+            font-size: 0.76rem;
+            line-height: 1.45;
+        }
+        .preview-panel { padding: 18px; min-width: 0; }
+        .preview-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        .preview-card { min-width: 0; }
+        .preview-card h3 { margin: 0 0 8px; color: var(--muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.08em; }
+        .stage {
+            min-height: 420px;
+            display: grid;
+            place-items: center;
+            overflow: auto;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            background:
+                linear-gradient(45deg, #e6e6e6 25%, transparent 25%),
+                linear-gradient(-45deg, #e6e6e6 25%, transparent 25%),
+                linear-gradient(45deg, transparent 75%, #e6e6e6 75%),
+                linear-gradient(-45deg, transparent 75%, #e6e6e6 75%),
+                #fff;
+            background-size: 22px 22px;
+            background-position: 0 0, 0 11px, 11px -11px, -11px 0;
+        }
+        canvas, #svgPreview svg { display: block; max-width: 100%; max-height: 70vh; width: auto; height: auto; }
+        #svgPreview { color: #111; }
+        .metadata { margin-top: 12px; color: var(--muted); font-size: 0.76rem; }
+        @media (max-width: 940px) {
+            main { grid-template-columns: 1fr; }
+            .preview-grid { grid-template-columns: 1fr; }
+            .stage { min-height: 320px; }
+        }
+        @media (max-width: 520px) {
+            main { width: min(100% - 20px, 1440px); }
+            header { padding: 13px; }
+            header p { display: none; }
+            .row { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+<header>
+    <div class="mark">HP</div>
+    <div>
+        <h1>HatchPlot Image to SVG</h1>
+        <p>Convert PNG, JPEG, WebP, BMP, GIF, and other browser-readable images into traceable SVG artwork.</p>
+    </div>
+    <a class="back-link" href="/">Toolpath Workspace</a>
+</header>
+<main>
+    <section class="panel controls">
+        <h2>Vectorization Settings</h2>
+        <div class="form-group">
+            <label for="imageInput">Source image</label>
+            <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif,image/avif,image/*">
+        </div>
+        <div class="form-group">
+            <label for="traceMode">Trace mode</label>
+            <select id="traceMode" title="Posterized fills preserve grayscale bands, Monochrome creates one filled silhouette, and Edge shapes isolate strong image edges.">
+                <option value="posterize">Posterized grayscale fills</option>
+                <option value="silhouette">Monochrome silhouette</option>
+                <option value="edges">Edge shapes</option>
+            </select>
+            <div id="traceModeHelp" class="helper"></div>
+        </div>
+        <div class="row">
+            <div class="form-group">
+                <label for="outputWidth">Output width (mm)</label>
+                <input id="outputWidth" type="number" min="1" max="5000" step="0.1" value="150" title="Physical width written into the SVG. Height follows the source aspect ratio.">
+            </div>
+            <div class="form-group">
+                <label for="maxDimension">Trace resolution (px)</label>
+                <input id="maxDimension" type="number" min="128" max="2048" step="32" value="900" title="Maximum raster dimension used for tracing. Higher values retain more detail but generate larger SVGs and take longer.">
+            </div>
+        </div>
+        <div id="posterizeOptions" class="mode-options">
+            <div class="form-group">
+                <label for="grayLevels">Grayscale levels</label>
+                <input id="grayLevels" type="number" min="2" max="8" step="1" value="4" title="Number of nested gray vector layers. More levels preserve tonal detail but create more paths.">
+            </div>
+        </div>
+        <div id="silhouetteOptions" class="mode-options" hidden>
+            <div class="form-group">
+                <label for="lumaThreshold">Luminance threshold (0–255)</label>
+                <input id="lumaThreshold" type="number" min="0" max="255" step="1" value="160" title="Pixels darker than this value become the filled vector silhouette. Invert reverses the comparison.">
+            </div>
+        </div>
+        <div id="edgeOptions" class="mode-options" hidden>
+            <div class="row">
+                <div class="form-group">
+                    <label for="edgeThreshold">Edge threshold</label>
+                    <input id="edgeThreshold" type="number" min="1" max="255" step="1" value="70" title="Minimum Sobel edge strength retained. Raise it to suppress weak texture and noise.">
+                </div>
+                <div class="form-group">
+                    <label for="edgeWidth">Edge width (px)</label>
+                    <input id="edgeWidth" type="number" min="1" max="6" step="1" value="2" title="Expands detected edge shapes before vectorization. Wider edges are more continuous but can merge nearby details.">
+                </div>
+            </div>
+        </div>
+        <div class="row">
+            <div class="form-group">
+                <label for="blurRadius">Noise blur (px)</label>
+                <input id="blurRadius" type="number" min="0" max="8" step="1" value="1" title="Applies a box blur before thresholding. Small values suppress compression noise; large values remove fine detail.">
+            </div>
+            <div class="form-group">
+                <label for="alphaThreshold">Alpha threshold</label>
+                <input id="alphaThreshold" type="number" min="0" max="255" step="1" value="16" title="Pixels below this opacity are treated as transparent and excluded from the SVG.">
+            </div>
+        </div>
+        <div class="row">
+            <div class="form-group">
+                <label for="despeckleArea">Despeckle area (px²)</label>
+                <input id="despeckleArea" type="number" min="0" max="100000" step="1" value="12" title="Closed regions smaller than this area are discarded as isolated noise.">
+            </div>
+            <div class="form-group">
+                <label for="simplifyTolerance">Simplify tolerance (px)</label>
+                <input id="simplifyTolerance" type="number" min="0" max="12" step="0.1" value="0.8" title="Reduces nearly redundant contour points. Higher values make smaller SVGs but can flatten fine features.">
+            </div>
+        </div>
+        <div class="form-group">
+            <label for="smoothingPasses">Contour smoothing passes</label>
+            <input id="smoothingPasses" type="number" min="0" max="3" step="1" value="1" title="Rounds pixel stair-steps using Chaikin smoothing. Zero preserves sharper corners; higher values produce softer contours.">
+        </div>
+        <div class="checkbox-row">
+            <input id="invertImage" type="checkbox">
+            <label for="invertImage">Invert light and dark before tracing</label>
+        </div>
+        <div class="checkbox-row">
+            <input id="whiteBackground" type="checkbox" checked>
+            <label for="whiteBackground">Composite transparency over white before analyzing brightness</label>
+        </div>
+        <div class="buttons">
+            <button id="previewBtn" type="button">Preview SVG</button>
+            <button id="downloadBtn" type="button" class="secondary" disabled>Download SVG</button>
+            <button id="sendBtn" type="button" class="secondary" disabled>Send to Toolpath Workspace</button>
+        </div>
+        <div id="status" class="status" aria-live="polite">Choose an image, tune the trace settings, then preview the generated SVG.</div>
+    </section>
+
+    <section class="panel preview-panel">
+        <h2>Conversion Preview</h2>
+        <div class="preview-grid">
+            <div class="preview-card">
+                <h3>Source raster</h3>
+                <div class="stage"><canvas id="sourcePreview" width="1" height="1"></canvas></div>
+            </div>
+            <div class="preview-card">
+                <h3>Generated SVG</h3>
+                <div class="stage"><div id="svgPreview">Preview has not been generated.</div></div>
+            </div>
+        </div>
+        <div id="metadata" class="metadata"></div>
+    </section>
+</main>
+<script src="converter.js"></script>
+</body>
+</html>

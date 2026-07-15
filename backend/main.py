@@ -307,12 +307,12 @@ def validate_generation_params(params: dict[str, Any]) -> None:
         raise GenerationError("penThickness must be between 0.05 and 10 mm.")
 
     generation_mode = str(params.get("generationMode", "hatch"))
-    if generation_mode not in {"hatch", "outline"}:
-        raise GenerationError("generationMode must be hatch or outline.")
+    if generation_mode not in {"hatch", "outline", "outline-hatch"}:
+        raise GenerationError("generationMode must be hatch, outline, or outline-hatch.")
     if params.get("workspaceOrigin", "top-left") not in {"top-left", "top-right", "bottom-left", "bottom-right"}:
         raise GenerationError("workspaceOrigin must be top-left, top-right, bottom-left, or bottom-right.")
 
-    if generation_mode == "hatch":
+    if generation_mode in {"hatch", "outline-hatch"}:
         density_fudge = float(params.get("densityFudge", 0.0))
         if not math.isfinite(density_fudge) or not -0.5 <= density_fudge <= 0.5:
             raise GenerationError("densityFudge must be between -0.5 and 0.5.")
@@ -343,7 +343,7 @@ def validate_generation_params(params: dict[str, Any]) -> None:
         if not math.isfinite(float(params[key])):
             raise GenerationError(f"{key} must be a finite number.")
 
-    if generation_mode == "outline":
+    if generation_mode in {"outline", "outline-hatch"}:
         for key in ("sourceWidthMm", "sourceHeightMm"):
             value = float(params.get(key, 0.0))
             if value and (not math.isfinite(value) or value <= 0.0):
@@ -1394,14 +1394,16 @@ def _gcode_preamble(params: dict[str, Any], path_count: int) -> list[str]:
         f"; Pen size: {float(params.get('penThickness', 0.5)):.3f} mm",
         f"; SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({display_svg_x:.3f}, {display_svg_y:.3f}) mm",
     ]
-    if generation_mode == "outline":
+    if generation_mode in {"outline", "outline-hatch"}:
         lines.append("; Outline: traces native SVG vector geometry; stroked paths follow their centerlines and filled shapes follow their vector boundaries")
-    else:
+    if generation_mode in {"hatch", "outline-hatch"}:
         lines.extend([
             f"; Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
             f"; Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={float(params.get('patternSpacing', 1.0)):.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({display_center_x:.3f}, {display_center_y:.3f}) mm; direction={direction}",
             f"; Waveform: type={_gcode_comment_value(params.get('waveform', 'zigzag'))}; amplitude={float(params.get('waveAmplitude', 0.5)):.3f} mm; wavelength={float(params.get('waveLength', 3.0)):.3f} mm",
         ])
+    if generation_mode == "outline-hatch":
+        lines.append("; Sequence: native SVG outlines are plotted first, followed by brightness-driven hatch paths")
     lines.extend([
         f"; Toolpaths: {path_count}",
         "; End HatchPlot header",
@@ -1445,6 +1447,106 @@ def generate_toolpath(
     validate_generation_params(params)
 
     generation_mode = str(params.get("generationMode", "hatch"))
+    if generation_mode == "outline-hatch":
+        if brightness_map is None:
+            raise GenerationError("Outline then Hatch requires the browser-rendered brightness map.")
+
+        _set_progress(
+            progress,
+            phase="outline-processing",
+            percent=3.0,
+            detail="Tracing native SVG outlines before brightness hatching...",
+            compute_backend="geos-cpu",
+        )
+        _check_cancel_requested(progress)
+        outline_params = dict(params)
+        outline_params["generationMode"] = "outline"
+        outline_result = generate_toolpath(svg_content, outline_params, None, None, None)
+        outline_paths = list(outline_result.get("paths") or [])
+        outline_stats = dict(outline_result.get("stats") or {})
+        _check_cancel_requested(progress)
+
+        outline_preview_state = {"points": 0, "chunks": 0}
+        outline_preview_pending: list[list[list[float]]] = []
+        outline_preview_points = 0
+        outline_pending_points = 0
+        for outline_path in outline_paths:
+            outline_preview_pending.append(outline_path)
+            outline_preview_points += len(outline_path)
+            outline_pending_points += len(outline_path)
+            if outline_pending_points >= LIVE_PREVIEW_CHUNK_POINTS:
+                _publish_live_preview(preview_queue, outline_preview_pending, outline_preview_state)
+                outline_preview_pending = []
+                outline_pending_points = 0
+        _publish_live_preview(preview_queue, outline_preview_pending, outline_preview_state)
+
+        hatch_params = dict(params)
+        hatch_params["generationMode"] = "hatch"
+        hatch_paths, raster_stats = _generate_brightness_paths(
+            brightness_map, hatch_params, progress, preview_queue
+        )
+        compiled_paths = outline_paths + hatch_paths
+        toolpath_points = sum(len(path) for path in compiled_paths)
+        if len(compiled_paths) > MAX_HATCH_PATHS:
+            raise GenerationLimitError(
+                f"The combined outline and hatch result generated more than {MAX_HATCH_PATHS:,} toolpaths."
+            )
+        if toolpath_points > MAX_TOOLPATH_POINTS:
+            raise GenerationLimitError(
+                f"The combined outline and hatch result exceeded {MAX_TOOLPATH_POINTS:,} toolpath points."
+            )
+
+        _set_progress(
+            progress,
+            phase="gcode",
+            percent=94.0,
+            completed=0,
+            total=len(compiled_paths),
+            detail="Compiling outline-first and hatch-second paths into G-code...",
+            compute_backend=raster_stats.get("compute_backend"),
+        )
+        _check_cancel_requested(progress)
+        gcode = _compile_gcode(compiled_paths, params)
+        duration = time.perf_counter() - started
+        combined_stats = {
+            **raster_stats,
+            "duration_seconds": round(duration, 3),
+            "drawable_elements": outline_stats.get("drawable_elements"),
+            "outline_paths": len(outline_paths),
+            "hatch_paths": len(hatch_paths),
+            "continuous_paths": len(compiled_paths),
+            "toolpath_points": toolpath_points,
+            "gcode_lines": len(gcode),
+            "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths))),
+            "pen_thickness_mm": float(params.get("penThickness", 0.5)),
+            "generation_mode": "outline-hatch",
+            "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
+            "outline_sampling_mm": outline_stats.get(
+                "outline_sampling_mm",
+                max(0.05, float(params.get("penThickness", 0.5)) * 0.35),
+            ),
+            "outline_trace_source": outline_stats.get("outline_trace_source", "svg-vector-geometry"),
+            "outline_trace_method": outline_stats.get("outline_trace_method", "vector-boundary"),
+            "path_sequence": "outline-then-hatch",
+            "live_preview_points": outline_preview_points + int(raster_stats.get("live_preview_points", 0)),
+        }
+        result = {
+            "gcode": "\n".join(gcode),
+            "paths": compiled_paths,
+            "stats": combined_stats,
+        }
+        _set_progress(
+            progress,
+            phase="completed",
+            percent=100.0,
+            completed=len(compiled_paths),
+            total=len(compiled_paths),
+            detail="Outline then Hatch toolpath generation completed.",
+            compute_backend=raster_stats.get("compute_backend"),
+            force_eta_zero=True,
+        )
+        return result
+
     if generation_mode == "hatch" and brightness_map is not None:
         compiled_paths, raster_stats = _generate_brightness_paths(brightness_map, params, progress, preview_queue)
         _set_progress(
