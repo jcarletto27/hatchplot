@@ -28,9 +28,11 @@ from PIL import Image, UnidentifiedImageError
 from linedraw_engine import LineDrawSettings, convert_image
 from converter_engines import (
     CommonRasterSettings,
+    InkscapeTraceSettings,
     Pixels2SvgSettings,
     PotraceSettings,
     converter_engine_status,
+    convert_inkscape,
     convert_pixels2svg,
     convert_potrace,
 )
@@ -104,7 +106,7 @@ async def lifespan(app: FastAPI):
         app.state.progress_manager.shutdown()
 
 
-app = FastAPI(title="HatchPlot API", version="2.3.0", lifespan=lifespan)
+app = FastAPI(title="HatchPlot API", version="2.4.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -2432,10 +2434,9 @@ def vectorize_raster_image(content: bytes, filename: str, settings: dict[str, An
     if engine not in engines:
         raise GenerationError("Unknown vectorization engine.")
     if not engines[engine].get("available"):
-        raise GenerationError(
-            f"{engines[engine].get('label', engine)} is not installed. "
-            "Rebuild HatchPlot with the GPL converter profile."
-        )
+        reason = str(engines[engine].get("reason", "")).strip()
+        detail = f" {reason}" if reason else " Rebuild HatchPlot with the GPL converter profile."
+        raise GenerationError(f"{engines[engine].get('label', engine)} is unavailable.{detail}")
 
     common = CommonRasterSettings(
         output_width_mm=max(1.0, min(5000.0, float(settings.get("outputWidth", 150.0)))),
@@ -2492,6 +2493,40 @@ def vectorize_raster_image(content: bytes, filename: str, settings: dict[str, An
             "engine_detail": "Linedraw-inspired plotter polylines",
         }
         svg = result.svg
+    elif engine == "inkscape":
+        inkscape_settings = InkscapeTraceSettings(
+            scans=max(2, min(256, int(settings.get("inkscapeScans", 8)))),
+            smooth=bool(settings.get("inkscapeSmooth", True)),
+            stack=bool(settings.get("inkscapeStack", True)),
+            remove_background=bool(settings.get("inkscapeRemoveBackground", True)),
+            speckles=max(0, min(100000, int(settings.get("inkscapeSpeckles", 2)))),
+            smooth_corners=max(0.0, min(1.334, float(settings.get("inkscapeSmoothCorners", 1.0)))),
+            optimize=max(0.0, min(5.0, float(settings.get("inkscapeOptimize", 0.2)))),
+            maximum_paths=min(MAX_HATCH_PATHS, 50000),
+            timeout_seconds=max(10, min(600, int(os.getenv("INKSCAPE_TRACE_TIMEOUT_SECONDS", "120")))),
+        )
+        try:
+            result = convert_inkscape(source_image, filename, common, inkscape_settings)
+        except ValueError as exc:
+            raise GenerationError(str(exc)) from exc
+        engine_suffix = "inkscape-trace"
+        stats = {
+            "mode": "color-multiscan",
+            "source_width": source_width,
+            "source_height": source_height,
+            "trace_width": result.width,
+            "trace_height": result.height,
+            "output_width_mm": round(result.output_width_mm, 4),
+            "output_height_mm": round(result.output_height_mm, 4),
+            "path_count": result.path_count,
+            "contour_paths": result.path_count,
+            "hatch_paths": 0,
+            "point_count": result.point_count,
+            "pen_up_travel_px": 0.0,
+            "engine": result.engine,
+            "engine_detail": result.engine_detail,
+        }
+        svg = result.svg
     elif engine == "potrace":
         potrace_settings = PotraceSettings(
             threshold=max(0, min(255, int(settings.get("potraceThreshold", 128)))),
@@ -2523,7 +2558,7 @@ def vectorize_raster_image(content: bytes, filename: str, settings: dict[str, An
             "engine_detail": result.engine_detail,
         }
         svg = result.svg
-    else:
+    elif engine == "pixels2svg":
         pixel_settings = Pixels2SvgSettings(
             max_colors=max(2, min(256, int(settings.get("pixelsMaxColors", 16)))),
             color_tolerance=max(0, min(765, int(settings.get("pixelsColorTolerance", 64)))),
@@ -2618,6 +2653,13 @@ async def vectorize_image(
     sortStrokes: bool = Form(True),
     invert: bool = Form(False),
     whiteBackground: bool = Form(True),
+    inkscapeScans: int = Form(8),
+    inkscapeSmooth: bool = Form(True),
+    inkscapeStack: bool = Form(True),
+    inkscapeRemoveBackground: bool = Form(True),
+    inkscapeSpeckles: int = Form(2),
+    inkscapeSmoothCorners: float = Form(1.0),
+    inkscapeOptimize: float = Form(0.2),
     potraceThreshold: int = Form(128),
     potraceTurdSize: int = Form(2),
     potraceTurnPolicy: str = Form("minority"),
@@ -2661,6 +2703,13 @@ async def vectorize_image(
         "sortStrokes": sortStrokes,
         "invert": invert,
         "whiteBackground": whiteBackground,
+        "inkscapeScans": inkscapeScans,
+        "inkscapeSmooth": inkscapeSmooth,
+        "inkscapeStack": inkscapeStack,
+        "inkscapeRemoveBackground": inkscapeRemoveBackground,
+        "inkscapeSpeckles": inkscapeSpeckles,
+        "inkscapeSmoothCorners": inkscapeSmoothCorners,
+        "inkscapeOptimize": inkscapeOptimize,
         "potraceThreshold": potraceThreshold,
         "potraceTurdSize": potraceTurdSize,
         "potraceTurnPolicy": potraceTurnPolicy,

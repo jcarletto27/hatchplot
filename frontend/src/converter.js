@@ -2,6 +2,7 @@
 
 const ENGINE_HELP = {
     linedraw: 'Plotter-oriented open contours and tonal hatches. Best for sketches, photographs, and mixed contour/hatch output.',
+    inkscape: 'Inkscape 1.4+ color multi-scan Trace Bitmap. Uses Inkscape itself for the same quantization, stacking, and Potrace curve fitting as the desktop application.',
     potrace: 'Smooth closed monochrome regions. Best for logos, handwriting, silhouettes, and high-contrast line art.',
     pixels2svg: 'Pixel/color-region polygons. Best for pixel art, indexed graphics, and segmentation masks; not intended to smooth photographic contours.'
 };
@@ -61,7 +62,7 @@ function apiPath(path) {
 }
 
 function normalizedEngineLabel(engine) {
-    return { linedraw: 'Linedraw', potrace: 'Potrace', pixels2svg: 'Pixels2SVG' }[engine] || engine;
+    return { linedraw: 'Linedraw', inkscape: 'Inkscape Trace Bitmap', potrace: 'Potrace', pixels2svg: 'Pixels2SVG' }[engine] || engine;
 }
 
 function inspectSvgIdentity(svgText) {
@@ -111,6 +112,7 @@ function updateModeVisibility() {
     document.getElementById('contourOptions').hidden = !isLinedraw || mode === 'hatch';
     document.getElementById('hatchOptions').hidden = !isLinedraw || mode === 'contour';
     document.getElementById('sortStrokesRow').hidden = !isLinedraw;
+    document.getElementById('inkscapeOptions').hidden = engine !== 'inkscape';
     document.getElementById('potraceOptions').hidden = engine !== 'potrace';
     document.getElementById('pixels2svgOptions').hidden = engine !== 'pixels2svg';
     document.getElementById('traceModeHelp').textContent = TRACE_MODE_HELP[mode] || '';
@@ -132,11 +134,11 @@ async function loadEngineAvailability() {
             const info = engines[option.value];
             if (!info) return;
             option.disabled = info.available !== true;
-            option.dataset.baseLabel = option.dataset.baseLabel || option.textContent.replace(/ \((?:not installed|checking…|checking\.\.\.)\)$/, '');
+            option.dataset.baseLabel = option.dataset.baseLabel || option.textContent.replace(/ \((?:not installed|unavailable|checking…|checking\.\.\.)\)$/, '');
             option.textContent = info.available === false
-                ? `${option.dataset.baseLabel} (not installed)`
+                ? `${option.dataset.baseLabel} (unavailable)`
                 : option.dataset.baseLabel;
-            option.title = [info.description, info.license].filter(Boolean).join(' ');
+            option.title = [info.description, info.version, info.license, info.reason].filter(Boolean).join(' ');
         });
         if (vectorEngine.selectedOptions[0]?.disabled) vectorEngine.value = 'linedraw';
         updateModeVisibility();
@@ -213,6 +215,13 @@ function readSettings() {
         sortStrokes: document.getElementById('sortStrokes').checked,
         invert: document.getElementById('invertImage').checked,
         whiteBackground: document.getElementById('whiteBackground').checked,
+        inkscapeScans: integerValue('inkscapeScans', 8, 2, 256),
+        inkscapeSmooth: document.getElementById('inkscapeSmooth').checked,
+        inkscapeStack: document.getElementById('inkscapeStack').checked,
+        inkscapeRemoveBackground: document.getElementById('inkscapeRemoveBackground').checked,
+        inkscapeSpeckles: integerValue('inkscapeSpeckles', 2, 0, 100000),
+        inkscapeSmoothCorners: numberValue('inkscapeSmoothCorners', 1, 0, 1.334),
+        inkscapeOptimize: numberValue('inkscapeOptimize', 0.2, 0, 5),
         potraceThreshold: integerValue('potraceThreshold', 128, 0, 255),
         potraceTurdSize: integerValue('potraceTurdSize', 2, 0, 100000),
         potraceTurnPolicy: document.getElementById('potraceTurnPolicy').value,
@@ -315,9 +324,11 @@ async function previewConversion() {
         ].filter(Boolean).join(' · ');
         statusNode.textContent = actualEngine === 'linedraw'
             ? 'Linedraw preview ready. Output contains plotter-oriented contour and hatch polylines.'
-            : actualEngine === 'potrace'
-                ? 'Potrace preview ready. Output contains smooth closed monochrome contour paths.'
-                : 'Pixels2SVG preview ready. Output contains quantized pixel/color-region polygons.';
+            : actualEngine === 'inkscape'
+                ? 'Inkscape preview ready. Output was produced by Inkscape color multi-scan Trace Bitmap.'
+                : actualEngine === 'potrace'
+                    ? 'Potrace preview ready. Output contains smooth closed monochrome contour paths.'
+                    : 'Pixels2SVG preview ready. Output contains quantized pixel/color-region polygons.';
     } catch (error) {
         generatedSvg = '';
         transferId = '';
