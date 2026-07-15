@@ -11,8 +11,8 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt requirements-gpu.txt ./
-RUN python3 -m pip install --no-cache-dir -r requirements-gpu.txt
+COPY requirements.txt requirements-gpu.txt requirements-gpu-gpl.txt ./
+RUN python3 -m pip install --no-cache-dir -r requirements-gpu-gpl.txt
 
 COPY main.py linedraw_engine.py converter_engines.py ./
 

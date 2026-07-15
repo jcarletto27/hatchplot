@@ -33,17 +33,17 @@ Hatch layouts include linear, spiral, concentric, and radial carriers. Waveforms
 
 Use the workspace switch at the top of either page to move between **Toolpath** and **Image Conversion**, or visit `/converter.html` directly.
 
-The converter accepts browser-readable raster formats including PNG, JPEG, WebP, BMP, GIF, and AVIF. It produces plotter-oriented, polyline-only SVG files with three modes:
+The converter accepts browser-readable raster formats including PNG, JPEG, WebP, BMP, GIF, and AVIF. A **Vectorization engine** selector exposes three distinct workflows:
 
-- **Contours only** detects connected image edges and emits open or closed stroked polylines.
-- **Hatches only** converts grayscale into three ordered hatch-density bands.
-- **Contours + hatches** combines both passes, with contours listed before hatches.
+- **Linedraw** is installed in every build. It creates open contour polylines, tonal hatches, or both, and is the best general-purpose choice for photographs and sketch-like artwork.
+- **Potrace** is an optional GPL engine for smooth closed monochrome regions. It is suited to logos, handwriting, silhouettes, and high-contrast line art. Controls include threshold, speckle area, ambiguous-turn policy, corner threshold, and curve optimization.
+- **Pixels2SVG** is an optional GPL engine for pixel art, indexed-color graphics, and segmentation masks. It converts adjacent pixel-color regions into polygons. Controls include color reduction, color tolerance, background removal, background tolerance, artifact preservation, and color grouping.
 
-Controls include physical output width, trace resolution, preview stroke width, automatic contrast, blur, alpha handling, Canny edge thresholds, contour simplification, minimum contour length, hatch cell size, three tonal thresholds, inversion, and stroke-order optimization. Previewed SVGs contain no embedded raster image and no filled pixel-cell regions.
+Common controls include physical output width, trace resolution, automatic contrast, blur, alpha handling, inversion, and transparent-background compositing. Linedraw adds Canny thresholds, contour simplification, minimum contour length, hatch cell size, tonal bands, preview stroke width, and stroke-order optimization.
 
-**Send to Toolpath Workspace** uses a short-lived backend transfer token rather than browser storage. The workspace consumes the generated SVG once and explicitly selects the requested generation mode. **Outline Trace** is recommended because converter output already contains the final contour and hatch polylines.
+**Send to Toolpath Workspace** uses a short-lived backend transfer token rather than browser storage. The workspace consumes the generated SVG once and explicitly selects the requested generation mode. **Outline Trace** is recommended for Potrace and Pixels2SVG because their output consists of closed vector regions; it follows those boundaries without re-rasterizing them.
 
-The converter engine is a Python 3/OpenCV adaptation of the contour, hatch, and nearest-endpoint ordering concepts from Lingdong Huang's MIT-licensed `linedraw` project. Attribution and the license text are included in `THIRD_PARTY_NOTICES.md`.
+The base converter uses HatchPlot's Python 3/OpenCV adaptation of concepts from Lingdong Huang's MIT-licensed `linedraw` project. Potrace and Pixels2SVG are intentionally opt-in because they use GPL licenses. Linedraw attribution remains in `THIRD_PARTY_NOTICES.md`; optional GPL-engine notices are in `OPTIONAL_GPL_NOTICES.md`, with license copies in `licenses/`.
 
 
 ## Start with CPU generation
@@ -61,6 +61,28 @@ Default host ports are configured in `.env`:
 - Image converter: `http://HOST:9090/converter.html`
 - API documentation: `http://HOST:9000/docs`
 - Backend health: `http://HOST:9000/health`
+
+## Optional GPL converter engines
+
+The normal Docker image includes only Linedraw. To install the Potrace and Pixels2SVG engines in the backend container, use the explicit GPL override:
+
+```bash
+docker compose -f compose.yml -f compose.gpl.yml down
+docker compose -f compose.yml -f compose.gpl.yml up --build -d
+docker compose -f compose.yml -f compose.gpl.yml logs -f backend
+```
+
+The converter page queries `/api/vectorize/engines` and disables engines that are not installed. The GPL image installs `potracer==0.0.4` and `pixels2svg==0.2.3` without changing the default engine.
+
+Pixels2SVG runtime grows with image dimensions and color-region count. For ordinary photographs, begin with 8–16 colors, a trace resolution of 512–1024 pixels, and a color tolerance of at least 64. Potrace is monochrome and is usually the better alternate engine when the goal is clean outlines rather than pixel-region preservation.
+
+For CUDA generation plus the GPL converter engines, use the combined GPU/GPL override:
+
+```bash
+docker compose -f compose.yml -f compose.gpu-gpl.yml down
+docker compose -f compose.yml -f compose.gpu-gpl.yml up --build -d
+docker compose -f compose.yml -f compose.gpu-gpl.yml logs -f backend
+```
 
 ## Optional NVIDIA CUDA sampling
 

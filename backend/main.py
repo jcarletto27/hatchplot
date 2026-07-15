@@ -25,6 +25,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from PIL import Image, UnidentifiedImageError
 from linedraw_engine import LineDrawSettings, convert_image
+from converter_engines import (
+    CommonRasterSettings,
+    Pixels2SvgSettings,
+    PotraceSettings,
+    converter_engine_status,
+    convert_pixels2svg,
+    convert_potrace,
+)
 from shapely import affinity
 from shapely.geometry import (
     GeometryCollection,
@@ -95,7 +103,7 @@ async def lifespan(app: FastAPI):
         app.state.progress_manager.shutdown()
 
 
-app = FastAPI(title="HatchPlot API", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="HatchPlot API", version="2.3.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -2418,63 +2426,156 @@ def vectorize_raster_image(content: bytes, filename: str, settings: dict[str, An
             f"The source image contains more than {MAX_BRIGHTNESS_MAP_PIXELS:,} pixels."
         )
 
-    line_settings = LineDrawSettings(
-        mode=str(settings.get("mode", "contour-hatch")),
+    engine = str(settings.get("engine", "linedraw")).strip().lower()
+    engines = converter_engine_status()
+    if engine not in engines:
+        raise GenerationError("Unknown vectorization engine.")
+    if not engines[engine].get("available"):
+        raise GenerationError(
+            f"{engines[engine].get('label', engine)} is not installed. "
+            "Rebuild HatchPlot with the GPL converter profile."
+        )
+
+    common = CommonRasterSettings(
         output_width_mm=max(1.0, min(5000.0, float(settings.get("outputWidth", 150.0)))),
-        max_dimension=max(128, min(4096, int(settings.get("maxDimension", 1024)))),
+        max_dimension=max(64, min(4096, int(settings.get("maxDimension", 1024)))),
         auto_contrast_cutoff=max(0.0, min(20.0, float(settings.get("autoContrastCutoff", 2.0)))),
         blur_radius=max(0, min(12, int(settings.get("blurRadius", 1)))),
         alpha_threshold=max(0, min(255, int(settings.get("alphaThreshold", 16)))),
         invert=bool(settings.get("invert", False)),
         white_background=bool(settings.get("whiteBackground", True)),
-        contour_low_threshold=max(1, min(254, int(settings.get("contourLowThreshold", 70)))),
-        contour_high_threshold=max(2, min(255, int(settings.get("contourHighThreshold", 180)))),
-        contour_simplify=max(0.0, min(20.0, float(settings.get("contourSimplify", 1.5)))),
-        minimum_contour_length=max(0.0, min(100000.0, float(settings.get("minimumContourLength", 10.0)))),
-        hatch_size=max(4, min(128, int(settings.get("hatchSize", 16)))),
-        hatch_light_threshold=max(1, min(254, int(settings.get("hatchLightThreshold", 160)))),
-        hatch_mid_threshold=max(0, min(254, int(settings.get("hatchMidThreshold", 96)))),
-        hatch_dark_threshold=max(0, min(254, int(settings.get("hatchDarkThreshold", 40)))),
-        sort_strokes=bool(settings.get("sortStrokes", True)),
-        stroke_width_mm=max(0.05, min(10.0, float(settings.get("strokeWidthMm", 0.35)))),
-        maximum_strokes=min(MAX_HATCH_PATHS, 30000),
-        maximum_points=MAX_TOOLPATH_POINTS,
     )
-    try:
-        result = convert_image(source_image, filename, line_settings)
-    except ValueError as exc:
-        raise GenerationError(str(exc)) from exc
+
+    if engine == "linedraw":
+        line_settings = LineDrawSettings(
+            mode=str(settings.get("mode", "contour-hatch")),
+            output_width_mm=common.output_width_mm,
+            max_dimension=max(128, common.max_dimension),
+            auto_contrast_cutoff=common.auto_contrast_cutoff,
+            blur_radius=common.blur_radius,
+            alpha_threshold=common.alpha_threshold,
+            invert=common.invert,
+            white_background=common.white_background,
+            contour_low_threshold=max(1, min(254, int(settings.get("contourLowThreshold", 70)))),
+            contour_high_threshold=max(2, min(255, int(settings.get("contourHighThreshold", 180)))),
+            contour_simplify=max(0.0, min(20.0, float(settings.get("contourSimplify", 1.5)))),
+            minimum_contour_length=max(0.0, min(100000.0, float(settings.get("minimumContourLength", 10.0)))),
+            hatch_size=max(4, min(128, int(settings.get("hatchSize", 16)))),
+            hatch_light_threshold=max(1, min(254, int(settings.get("hatchLightThreshold", 160)))),
+            hatch_mid_threshold=max(0, min(254, int(settings.get("hatchMidThreshold", 96)))),
+            hatch_dark_threshold=max(0, min(254, int(settings.get("hatchDarkThreshold", 40)))),
+            sort_strokes=bool(settings.get("sortStrokes", True)),
+            stroke_width_mm=max(0.05, min(10.0, float(settings.get("strokeWidthMm", 0.35)))),
+            maximum_strokes=min(MAX_HATCH_PATHS, 30000),
+            maximum_points=MAX_TOOLPATH_POINTS,
+        )
+        try:
+            result = convert_image(source_image, filename, line_settings)
+        except ValueError as exc:
+            raise GenerationError(str(exc)) from exc
+        engine_suffix = f"linedraw-{line_settings.mode}"
+        stats = {
+            "mode": line_settings.mode,
+            "source_width": source_width,
+            "source_height": source_height,
+            "trace_width": result.width,
+            "trace_height": result.height,
+            "output_width_mm": round(result.output_width_mm, 4),
+            "output_height_mm": round(result.output_height_mm, 4),
+            "path_count": result.stroke_count,
+            "contour_paths": len(result.contours),
+            "hatch_paths": len(result.hatches),
+            "point_count": result.point_count,
+            "pen_up_travel_px": round(result.travel_distance_px, 3),
+            "engine": "linedraw",
+            "engine_detail": "Linedraw-inspired plotter polylines",
+        }
+        svg = result.svg
+    elif engine == "potrace":
+        potrace_settings = PotraceSettings(
+            threshold=max(0, min(255, int(settings.get("potraceThreshold", 128)))),
+            turd_size=max(0, min(100000, int(settings.get("potraceTurdSize", 2)))),
+            turn_policy=str(settings.get("potraceTurnPolicy", "minority")),
+            alpha_max=max(0.0, min(1.334, float(settings.get("potraceAlphaMax", 1.0)))),
+            optimize_curves=bool(settings.get("potraceOptimizeCurves", True)),
+            optimize_tolerance=max(0.0, min(5.0, float(settings.get("potraceOptimizeTolerance", 0.2)))),
+        )
+        try:
+            result = convert_potrace(source_image, filename, common, potrace_settings)
+        except ValueError as exc:
+            raise GenerationError(str(exc)) from exc
+        engine_suffix = "potrace"
+        stats = {
+            "mode": "regions",
+            "source_width": source_width,
+            "source_height": source_height,
+            "trace_width": result.width,
+            "trace_height": result.height,
+            "output_width_mm": round(result.output_width_mm, 4),
+            "output_height_mm": round(result.output_height_mm, 4),
+            "path_count": result.path_count,
+            "contour_paths": result.path_count,
+            "hatch_paths": 0,
+            "point_count": result.point_count,
+            "pen_up_travel_px": 0.0,
+            "engine": result.engine,
+            "engine_detail": result.engine_detail,
+        }
+        svg = result.svg
+    else:
+        pixel_settings = Pixels2SvgSettings(
+            max_colors=max(2, min(256, int(settings.get("pixelsMaxColors", 16)))),
+            color_tolerance=max(0, min(765, int(settings.get("pixelsColorTolerance", 64)))),
+            remove_background=bool(settings.get("pixelsRemoveBackground", True)),
+            background_tolerance=max(0.0, min(50.0, float(settings.get("pixelsBackgroundTolerance", 1.0)))),
+            maximum_artifact_percent=max(0.0, min(100.0, float(settings.get("pixelsArtifactPercent", 0.1)))),
+            group_by_color=bool(settings.get("pixelsGroupByColor", True)),
+            maximum_paths=min(MAX_HATCH_PATHS, 50000),
+        )
+        try:
+            result = convert_pixels2svg(source_image, filename, common, pixel_settings)
+        except ValueError as exc:
+            raise GenerationError(str(exc)) from exc
+        engine_suffix = "pixels2svg"
+        stats = {
+            "mode": "color-regions",
+            "source_width": source_width,
+            "source_height": source_height,
+            "trace_width": result.width,
+            "trace_height": result.height,
+            "output_width_mm": round(result.output_width_mm, 4),
+            "output_height_mm": round(result.output_height_mm, 4),
+            "path_count": result.path_count,
+            "contour_paths": result.path_count,
+            "hatch_paths": 0,
+            "point_count": result.point_count,
+            "pen_up_travel_px": 0.0,
+            "engine": result.engine,
+            "engine_detail": result.engine_detail,
+        }
+        svg = result.svg
 
     safe_base = os.path.splitext(os.path.basename(filename or "converted-image"))[0]
     safe_base = "".join(character if character.isalnum() or character in "-_." else "-" for character in safe_base).strip("-.")
-    output_filename = f"{safe_base or 'converted-image'}-{line_settings.mode}.svg"
-    stats = {
-        "mode": line_settings.mode,
-        "source_width": source_width,
-        "source_height": source_height,
-        "trace_width": result.width,
-        "trace_height": result.height,
-        "output_width_mm": round(result.output_width_mm, 4),
-        "output_height_mm": round(result.output_height_mm, 4),
-        "path_count": result.stroke_count,
-        "contour_paths": len(result.contours),
-        "hatch_paths": len(result.hatches),
-        "point_count": result.point_count,
-        "pen_up_travel_px": round(result.travel_distance_px, 3),
-        "engine": "linedraw-inspired-polylines",
-    }
-    transfer_id = _store_converter_transfer(result.svg, output_filename, stats)
+    output_filename = f"{safe_base or 'converted-image'}-{engine_suffix}.svg"
+    transfer_id = _store_converter_transfer(svg, output_filename, stats)
     return {
-        "svg": result.svg,
+        "svg": svg,
         "filename": output_filename,
         "transfer_id": transfer_id,
         "stats": stats,
     }
 
 
+@app.get("/vectorize/engines")
+def vectorize_engines() -> dict[str, Any]:
+    return {"engines": converter_engine_status()}
+
+
 @app.post("/vectorize")
 async def vectorize_image(
     file: UploadFile = File(...),
+    engine: str = Form("linedraw"),
     mode: str = Form("contour-hatch"),
     outputWidth: float = Form(150.0),
     maxDimension: int = Form(1024),
@@ -2493,6 +2594,18 @@ async def vectorize_image(
     sortStrokes: bool = Form(True),
     invert: bool = Form(False),
     whiteBackground: bool = Form(True),
+    potraceThreshold: int = Form(128),
+    potraceTurdSize: int = Form(2),
+    potraceTurnPolicy: str = Form("minority"),
+    potraceAlphaMax: float = Form(1.0),
+    potraceOptimizeCurves: bool = Form(True),
+    potraceOptimizeTolerance: float = Form(0.2),
+    pixelsMaxColors: int = Form(16),
+    pixelsColorTolerance: int = Form(64),
+    pixelsRemoveBackground: bool = Form(True),
+    pixelsBackgroundTolerance: float = Form(1.0),
+    pixelsArtifactPercent: float = Form(0.1),
+    pixelsGroupByColor: bool = Form(True),
 ):
     content = await file.read(MAX_UPLOAD_BYTES + 1)
     filename = file.filename or "converted-image"
@@ -2505,6 +2618,7 @@ async def vectorize_image(
             detail=f"The image exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.",
         )
     settings = {
+        "engine": engine,
         "mode": mode,
         "outputWidth": outputWidth,
         "maxDimension": maxDimension,
@@ -2523,6 +2637,18 @@ async def vectorize_image(
         "sortStrokes": sortStrokes,
         "invert": invert,
         "whiteBackground": whiteBackground,
+        "potraceThreshold": potraceThreshold,
+        "potraceTurdSize": potraceTurdSize,
+        "potraceTurnPolicy": potraceTurnPolicy,
+        "potraceAlphaMax": potraceAlphaMax,
+        "potraceOptimizeCurves": potraceOptimizeCurves,
+        "potraceOptimizeTolerance": potraceOptimizeTolerance,
+        "pixelsMaxColors": pixelsMaxColors,
+        "pixelsColorTolerance": pixelsColorTolerance,
+        "pixelsRemoveBackground": pixelsRemoveBackground,
+        "pixelsBackgroundTolerance": pixelsBackgroundTolerance,
+        "pixelsArtifactPercent": pixelsArtifactPercent,
+        "pixelsGroupByColor": pixelsGroupByColor,
     }
     try:
         return vectorize_raster_image(content, filename, settings)
@@ -2552,6 +2678,7 @@ def health() -> dict[str, Any]:
         "active_jobs": _active_job_count(),
         "job_workers": JOB_WORKERS,
         "acceleration_backend": ACCELERATION_BACKEND,
+        "converter_engines": converter_engine_status(),
         "pending_converter_transfers": len(converter_transfers),
     }
 

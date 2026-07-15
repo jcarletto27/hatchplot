@@ -178,7 +178,7 @@
     <div class="mark">HP</div>
     <div>
         <h1>HatchPlot Image to SVG</h1>
-        <p>Convert standard images into plotter-ready contour and hatch polylines using a linedraw-inspired engine.</p>
+        <p>Choose between plotter-oriented Linedraw, smooth Potrace contours, and Pixels2SVG color regions.</p>
     </div>
     <nav class="workspace-switch" aria-label="HatchPlot workspace">
         <a href="./">Toolpath</a>
@@ -193,6 +193,15 @@
             <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif,image/avif,image/*">
         </div>
         <div class="form-group">
+            <label for="vectorEngine">Vectorization engine</label>
+            <select id="vectorEngine" title="Choose the algorithm used to convert raster pixels into SVG geometry.">
+                <option value="linedraw" selected>Linedraw — contours and hatches</option>
+                <option value="potrace">Potrace — smooth monochrome regions</option>
+                <option value="pixels2svg">Pixels2SVG — pixel/color regions</option>
+            </select>
+            <div id="vectorEngineHelp" class="helper"></div>
+        </div>
+        <div id="linedrawModeGroup" class="form-group">
             <label for="traceMode">Line-drawing mode</label>
             <select id="traceMode" title="Contour detects image edges, Hatch converts grayscale into plotter strokes, and Contour + Hatch combines both passes.">
                 <option value="contour">Contours only</option>
@@ -278,7 +287,81 @@
             </div>
         </div>
 
-        <div class="checkbox-row">
+        <div id="potraceOptions" class="mode-options" hidden>
+            <h2>Potrace Settings</h2>
+            <div class="row">
+                <div class="form-group">
+                    <label for="potraceThreshold">Black threshold</label>
+                    <input id="potraceThreshold" type="number" min="0" max="255" step="1" value="128" title="Pixels darker than this value become traced foreground regions. Raise it to include lighter lines.">
+                </div>
+                <div class="form-group">
+                    <label for="potraceTurdSize">Speckle area (px²)</label>
+                    <input id="potraceTurdSize" type="number" min="0" max="100000" step="1" value="2" title="Discard connected regions at or below this pixel area. Increase it to remove isolated noise.">
+                </div>
+            </div>
+            <div class="row">
+                <div class="form-group">
+                    <label for="potraceTurnPolicy">Ambiguous-turn policy</label>
+                    <select id="potraceTurnPolicy" title="Controls how Potrace resolves diagonal pixel connections and ambiguous corners.">
+                        <option value="minority" selected>Minority</option>
+                        <option value="majority">Majority</option>
+                        <option value="black">Prefer black</option>
+                        <option value="white">Prefer white</option>
+                        <option value="left">Always left</option>
+                        <option value="right">Always right</option>
+                        <option value="random">Deterministic random</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="potraceAlphaMax">Corner threshold</label>
+                    <input id="potraceAlphaMax" type="number" min="0" max="1.334" step="0.05" value="1" title="Lower values preserve sharper corners; higher values favor smooth Bézier curves.">
+                </div>
+            </div>
+            <div class="checkbox-row">
+                <input id="potraceOptimizeCurves" type="checkbox" checked>
+                <label for="potraceOptimizeCurves">Optimize adjacent Bézier segments</label>
+            </div>
+            <div class="form-group">
+                <label for="potraceOptimizeTolerance">Curve optimization tolerance</label>
+                <input id="potraceOptimizeTolerance" type="number" min="0" max="5" step="0.05" value="0.2" title="Higher values merge more curve segments and reduce SVG complexity at the cost of exactness.">
+            </div>
+            <div class="helper">Best for logos, handwriting, silhouettes, and monochrome line art. Output consists of closed filled regions whose boundaries are traced by Outline mode.</div>
+        </div>
+
+        <div id="pixels2svgOptions" class="mode-options" hidden>
+            <h2>Pixels2SVG Settings</h2>
+            <div class="row">
+                <div class="form-group">
+                    <label for="pixelsMaxColors">Maximum colors</label>
+                    <input id="pixelsMaxColors" type="number" min="2" max="256" step="1" value="16" title="Quantizes the source before Pixels2SVG. Fewer colors greatly reduce runtime and region count.">
+                </div>
+                <div class="form-group">
+                    <label for="pixelsColorTolerance">Color tolerance</label>
+                    <input id="pixelsColorTolerance" type="number" min="0" max="765" step="1" value="64" title="Merges adjacent regions with similar luminosity. Higher values create fewer, larger polygons.">
+                </div>
+            </div>
+            <div class="checkbox-row">
+                <input id="pixelsRemoveBackground" type="checkbox" checked>
+                <label for="pixelsRemoveBackground">Attempt to remove a solid background</label>
+            </div>
+            <div class="row">
+                <div class="form-group">
+                    <label for="pixelsBackgroundTolerance">Background tolerance</label>
+                    <input id="pixelsBackgroundTolerance" type="number" min="0" max="50" step="0.1" value="1" title="Blur/tolerance used by Pixels2SVG when detecting a solid background.">
+                </div>
+                <div class="form-group">
+                    <label for="pixelsArtifactPercent">Preserve nearby artifact (%)</label>
+                    <input id="pixelsArtifactPercent" type="number" min="0" max="100" step="0.05" value="0.1" title="Small non-background components near detected contours below this percentage may be preserved.">
+                </div>
+            </div>
+            <div class="checkbox-row">
+                <input id="pixelsGroupByColor" type="checkbox" checked>
+                <label for="pixelsGroupByColor">Group regions by color in the SVG</label>
+            </div>
+            <div class="helper">Best for pixel art, indexed-color graphics, and segmentation masks. It intentionally preserves pixel-region boundaries and can be slow on high-resolution photographs.</div>
+        </div>
+
+        <div id="sortStrokesRow" class="checkbox-row">
             <input id="sortStrokes" type="checkbox" checked>
             <label for="sortStrokes">Optimize stroke order to reduce pen-up travel</label>
         </div>
@@ -304,7 +387,7 @@
             <button id="downloadBtn" type="button" class="secondary" disabled>Download SVG</button>
             <button id="sendBtn" type="button" class="secondary" disabled>Send to Toolpath Workspace</button>
         </div>
-        <div id="status" class="status" aria-live="polite">Choose an image, tune the trace settings, then preview the generated SVG.</div>
+        <div id="status" class="status" aria-live="polite">Choose an image and vectorization engine, tune its settings, then preview the generated SVG.</div>
     </section>
 
     <section class="panel preview-panel">

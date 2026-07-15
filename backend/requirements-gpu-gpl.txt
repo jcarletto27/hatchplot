@@ -1,0 +1,3 @@
+-r requirements-gpu.txt
+pixels2svg==0.2.3
+potracer==0.0.4

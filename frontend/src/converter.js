@@ -1,5 +1,11 @@
 'use strict';
 
+const ENGINE_HELP = {
+    linedraw: 'Plotter-oriented open contours and tonal hatches. Best for sketches, photographs, and mixed contour/hatch output.',
+    potrace: 'Smooth closed monochrome regions. Best for logos, handwriting, silhouettes, and high-contrast line art.',
+    pixels2svg: 'Pixel/color-region polygons. Best for pixel art, indexed graphics, and segmentation masks; not intended to smooth photographic contours.'
+};
+
 const TRACE_MODE_HELP = {
     contour: 'Detects image edges and converts them into open plotter polylines. This is the closest equivalent to linedraw contour-only mode.',
     hatch: 'Builds tone-dependent hatch strokes directly from image brightness. Dark cells receive additional strokes; light cells receive few or none.',
@@ -16,6 +22,7 @@ let lastTraceStats = null;
 let busy = false;
 
 const imageInput = document.getElementById('imageInput');
+const vectorEngine = document.getElementById('vectorEngine');
 const traceMode = document.getElementById('traceMode');
 const sourcePreview = document.getElementById('sourcePreview');
 const svgPreview = document.getElementById('svgPreview');
@@ -71,11 +78,43 @@ function invalidatePreview(message = 'Settings changed. Preview again before dow
 }
 
 function updateModeVisibility() {
+    const engine = vectorEngine.value;
     const mode = traceMode.value;
-    document.getElementById('contourOptions').hidden = mode === 'hatch';
-    document.getElementById('hatchOptions').hidden = mode === 'contour';
+    const isLinedraw = engine === 'linedraw';
+    document.getElementById('linedrawModeGroup').hidden = !isLinedraw;
+    document.getElementById('contourOptions').hidden = !isLinedraw || mode === 'hatch';
+    document.getElementById('hatchOptions').hidden = !isLinedraw || mode === 'contour';
+    document.getElementById('sortStrokesRow').hidden = !isLinedraw;
+    document.getElementById('potraceOptions').hidden = engine !== 'potrace';
+    document.getElementById('pixels2svgOptions').hidden = engine !== 'pixels2svg';
     document.getElementById('traceModeHelp').textContent = TRACE_MODE_HELP[mode] || '';
+    document.getElementById('vectorEngineHelp').textContent = ENGINE_HELP[engine] || '';
     traceMode.title = TRACE_MODE_HELP[mode] || '';
+    vectorEngine.title = ENGINE_HELP[engine] || '';
+}
+
+async function loadEngineAvailability() {
+    try {
+        const response = await fetch(apiPath('vectorize/engines'), { headers: { Accept: 'application/json' } });
+        if (!response.ok) throw new Error(await readApiError(response));
+        const payload = await response.json();
+        const engines = payload?.engines || {};
+        Array.from(vectorEngine.options).forEach(option => {
+            const info = engines[option.value];
+            if (!info) return;
+            option.disabled = info.available === false;
+            option.dataset.baseLabel = option.dataset.baseLabel || option.textContent.replace(/ \(not installed\)$/, '');
+            option.textContent = info.available === false
+                ? `${option.dataset.baseLabel} (not installed)`
+                : option.dataset.baseLabel;
+            option.title = [info.description, info.license].filter(Boolean).join(' ');
+        });
+        if (vectorEngine.selectedOptions[0]?.disabled) vectorEngine.value = 'linedraw';
+        updateModeVisibility();
+    } catch (error) {
+        console.warn('Unable to query optional converter engines:', error);
+        document.getElementById('vectorEngineHelp').textContent = 'Engine availability could not be checked. Linedraw remains available; optional engines may require the GPL Docker profile.';
+    }
 }
 
 function drawSourcePreview(image) {
@@ -121,9 +160,10 @@ function readSettings() {
     const mid = Math.min(light, integerValue('hatchMidThreshold', 96, 0, 254));
     const dark = Math.min(mid, integerValue('hatchDarkThreshold', 40, 0, 254));
     return {
+        engine: vectorEngine.value,
         mode: traceMode.value,
         outputWidth: numberValue('outputWidth', 150, 1, 5000),
-        maxDimension: integerValue('maxDimension', 1024, 128, 4096),
+        maxDimension: integerValue('maxDimension', 1024, 64, 4096),
         strokeWidthMm: numberValue('strokeWidthMm', 0.35, 0.05, 10),
         autoContrastCutoff: numberValue('autoContrastCutoff', 2, 0, 20),
         blurRadius: integerValue('blurRadius', 1, 0, 12),
@@ -138,7 +178,19 @@ function readSettings() {
         hatchDarkThreshold: dark,
         sortStrokes: document.getElementById('sortStrokes').checked,
         invert: document.getElementById('invertImage').checked,
-        whiteBackground: document.getElementById('whiteBackground').checked
+        whiteBackground: document.getElementById('whiteBackground').checked,
+        potraceThreshold: integerValue('potraceThreshold', 128, 0, 255),
+        potraceTurdSize: integerValue('potraceTurdSize', 2, 0, 100000),
+        potraceTurnPolicy: document.getElementById('potraceTurnPolicy').value,
+        potraceAlphaMax: numberValue('potraceAlphaMax', 1, 0, 1.334),
+        potraceOptimizeCurves: document.getElementById('potraceOptimizeCurves').checked,
+        potraceOptimizeTolerance: numberValue('potraceOptimizeTolerance', 0.2, 0, 5),
+        pixelsMaxColors: integerValue('pixelsMaxColors', 16, 2, 256),
+        pixelsColorTolerance: integerValue('pixelsColorTolerance', 64, 0, 765),
+        pixelsRemoveBackground: document.getElementById('pixelsRemoveBackground').checked,
+        pixelsBackgroundTolerance: numberValue('pixelsBackgroundTolerance', 1, 0, 50),
+        pixelsArtifactPercent: numberValue('pixelsArtifactPercent', 0.1, 0, 100),
+        pixelsGroupByColor: document.getElementById('pixelsGroupByColor').checked
     };
 }
 
@@ -167,7 +219,7 @@ async function previewConversion() {
         alert('Choose an image first.');
         return;
     }
-    setBusy(true, 'Generating plotter-oriented contours and hatches...');
+    setBusy(true, `Generating SVG with ${vectorEngine.selectedOptions[0]?.textContent || vectorEngine.value}...`);
     try {
         const settings = readSettings();
         const response = await fetch(apiPath('vectorize'), {
@@ -182,20 +234,25 @@ async function previewConversion() {
         }
 
         generatedSvg = result.svg;
-        generatedFilename = result.filename || `${safeBaseName(sourceFilename)}-${settings.mode}.svg`;
+        generatedFilename = result.filename || `${safeBaseName(sourceFilename)}-${settings.engine}.svg`;
         transferId = result.transfer_id;
         lastTraceStats = result.stats;
         svgPreview.innerHTML = generatedSvg;
         const stats = result.stats;
         metadataNode.textContent = [
             `${Number(stats.trace_width).toLocaleString()} × ${Number(stats.trace_height).toLocaleString()} trace raster`,
-            `${Number(stats.contour_paths || 0).toLocaleString()} contour strokes`,
-            `${Number(stats.hatch_paths || 0).toLocaleString()} hatch strokes`,
-            `${Number(stats.point_count || 0).toLocaleString()} points`,
+            `${Number(stats.path_count || 0).toLocaleString()} vector paths/regions`,
+            `${Number(stats.contour_paths || 0).toLocaleString()} contour paths`,
+            `${Number(stats.hatch_paths || 0).toLocaleString()} hatch paths`,
+            `${Number(stats.point_count || 0).toLocaleString()} points/segments`,
             `${Number(stats.output_width_mm).toFixed(1)} × ${Number(stats.output_height_mm).toFixed(1)} mm`,
-            'linedraw-inspired polyline engine'
-        ].join(' · ');
-        statusNode.textContent = 'SVG preview ready. Every visible mark is an open or closed stroked polyline; there are no filled raster-cell regions.';
+            stats.engine_detail || stats.engine || settings.engine
+        ].filter(Boolean).join(' · ');
+        statusNode.textContent = settings.engine === 'linedraw'
+            ? 'SVG preview ready. Linedraw output contains plotter-oriented contour and hatch polylines.'
+            : settings.engine === 'potrace'
+                ? 'SVG preview ready. Potrace produced smooth closed monochrome regions; Outline Trace will follow their boundaries.'
+                : 'SVG preview ready. Pixels2SVG produced quantized color-region polygons; Outline Trace will follow their boundaries.';
     } catch (error) {
         generatedSvg = '';
         transferId = '';
@@ -244,6 +301,10 @@ imageInput.addEventListener('change', async event => {
     }
 });
 
+vectorEngine.addEventListener('change', () => {
+    updateModeVisibility();
+    invalidatePreview('Vectorization engine changed. Preview again before downloading or sending the SVG.');
+});
 traceMode.addEventListener('change', () => {
     updateModeVisibility();
     invalidatePreview();
@@ -252,7 +313,7 @@ previewButton.addEventListener('click', previewConversion);
 downloadButton.addEventListener('click', downloadSvg);
 sendButton.addEventListener('click', sendToWorkspace);
 
-document.querySelectorAll('input:not(#imageInput), select:not(#traceMode):not(#workspaceMode)').forEach(control => {
+document.querySelectorAll('input:not(#imageInput), select:not(#traceMode):not(#vectorEngine):not(#workspaceMode)').forEach(control => {
     control.addEventListener('change', () => invalidatePreview());
 });
 
@@ -270,4 +331,5 @@ document.querySelectorAll('input[type="number"]').forEach(input => {
 });
 
 updateModeVisibility();
+loadEngineAvailability();
 setBusy(false);
