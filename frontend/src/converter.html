@@ -165,7 +165,7 @@
     <div class="mark">HP</div>
     <div>
         <h1>HatchPlot Image to SVG</h1>
-        <p>Convert standard raster images into smooth, native SVG paths for outline tracing or brightness hatching.</p>
+        <p>Convert standard images into plotter-ready contour and hatch polylines using a linedraw-inspired engine.</p>
     </div>
     <a class="back-link" href="/">Toolpath Workspace</a>
 </header>
@@ -177,11 +177,11 @@
             <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif,image/avif,image/*">
         </div>
         <div class="form-group">
-            <label for="traceMode">Trace mode</label>
-            <select id="traceMode" title="Posterized fills preserve grayscale bands, Monochrome creates one filled silhouette, and Edge shapes isolate strong image edges.">
-                <option value="posterize">Posterized grayscale fills</option>
-                <option value="silhouette">Monochrome silhouette</option>
-                <option value="edges">Edge outlines</option>
+            <label for="traceMode">Line-drawing mode</label>
+            <select id="traceMode" title="Contour detects image edges, Hatch converts grayscale into plotter strokes, and Contour + Hatch combines both passes.">
+                <option value="contour">Contours only</option>
+                <option value="hatch">Hatches only</option>
+                <option value="contour-hatch" selected>Contours + hatches</option>
             </select>
             <div id="traceModeHelp" class="helper"></div>
         </div>
@@ -192,56 +192,79 @@
             </div>
             <div class="form-group">
                 <label for="maxDimension">Trace resolution (px)</label>
-                <input id="maxDimension" type="number" min="128" max="4096" step="32" value="900" title="Maximum raster dimension used for tracing. Higher values retain more detail but generate larger SVGs and take longer.">
+                <input id="maxDimension" type="number" min="128" max="4096" step="32" value="1024" title="Maximum raster dimension analyzed by the line-drawing engine. Higher values preserve more detail but create more points.">
             </div>
         </div>
-        <div id="posterizeOptions" class="mode-options">
+        <div class="row">
             <div class="form-group">
-                <label for="grayLevels">Grayscale levels</label>
-                <input id="grayLevels" type="number" min="2" max="8" step="1" value="4" title="Number of nested gray vector layers. More levels preserve tonal detail but create more paths.">
+                <label for="strokeWidthMm">Preview stroke width (mm)</label>
+                <input id="strokeWidthMm" type="number" min="0.05" max="10" step="0.05" value="0.35" title="Stroke width written into the SVG for preview. Toolpath geometry follows each polyline centerline.">
             </div>
-        </div>
-        <div id="silhouetteOptions" class="mode-options" hidden>
             <div class="form-group">
-                <label for="lumaThreshold">Luminance threshold (0–255)</label>
-                <input id="lumaThreshold" type="number" min="0" max="255" step="1" value="160" title="Pixels darker than this value become the filled vector silhouette. Invert reverses the comparison.">
-            </div>
-        </div>
-        <div id="edgeOptions" class="mode-options" hidden>
-            <div class="row">
-                <div class="form-group">
-                    <label for="edgeThreshold">Edge threshold</label>
-                    <input id="edgeThreshold" type="number" min="1" max="255" step="1" value="70" title="Minimum Sobel edge strength retained. Raise it to suppress weak texture and noise.">
-                </div>
-                <div class="form-group">
-                    <label for="edgeWidth">Edge width (px)</label>
-                    <input id="edgeWidth" type="number" min="1" max="6" step="1" value="2" title="Expands detected edge shapes before vectorization. Wider edges are more continuous but can merge nearby details.">
-                </div>
+                <label for="autoContrastCutoff">Auto-contrast cutoff (%)</label>
+                <input id="autoContrastCutoff" type="number" min="0" max="20" step="0.5" value="2" title="Clips this percentage of the darkest and lightest pixels before tracing. Small values improve contrast without amplifying much noise.">
             </div>
         </div>
         <div class="row">
             <div class="form-group">
                 <label for="blurRadius">Noise blur (px)</label>
-                <input id="blurRadius" type="number" min="0" max="8" step="1" value="1" title="Applies a box blur before thresholding. Small values suppress compression noise; large values remove fine detail.">
+                <input id="blurRadius" type="number" min="0" max="12" step="1" value="1" title="Gaussian blur applied before contour and hatch analysis. Raise it to suppress texture and compression noise.">
             </div>
             <div class="form-group">
                 <label for="alphaThreshold">Alpha threshold</label>
-                <input id="alphaThreshold" type="number" min="0" max="255" step="1" value="16" title="Pixels below this opacity are treated as transparent and excluded from the SVG.">
+                <input id="alphaThreshold" type="number" min="0" max="255" step="1" value="16" title="Pixels below this opacity are excluded from tracing.">
             </div>
         </div>
-        <div class="row">
-            <div class="form-group">
-                <label for="despeckleArea">Despeckle area (px²)</label>
-                <input id="despeckleArea" type="number" min="0" max="100000" step="1" value="12" title="Closed regions smaller than this area are discarded as isolated noise.">
+
+        <div id="contourOptions" class="mode-options">
+            <h2>Contour Settings</h2>
+            <div class="row">
+                <div class="form-group">
+                    <label for="contourLowThreshold">Canny low threshold</label>
+                    <input id="contourLowThreshold" type="number" min="1" max="254" step="1" value="70" title="Weak edge threshold. Lower values retain faint detail but may include texture noise.">
+                </div>
+                <div class="form-group">
+                    <label for="contourHighThreshold">Canny high threshold</label>
+                    <input id="contourHighThreshold" type="number" min="2" max="255" step="1" value="180" title="Strong edge threshold. Edges above this value seed connected contour strokes.">
+                </div>
             </div>
-            <div class="form-group">
-                <label for="simplifyTolerance">Simplify tolerance (px)</label>
-                <input id="simplifyTolerance" type="number" min="0" max="12" step="0.1" value="0.8" title="Reduces nearly redundant contour points. Higher values make smaller SVGs but can flatten fine features.">
+            <div class="row">
+                <div class="form-group">
+                    <label for="contourSimplify">Contour simplify (px)</label>
+                    <input id="contourSimplify" type="number" min="0" max="20" step="0.1" value="1.5" title="Reduces redundant contour points after edge tracing. Increase it for smaller, smoother SVGs.">
+                </div>
+                <div class="form-group">
+                    <label for="minimumContourLength">Minimum contour length (px)</label>
+                    <input id="minimumContourLength" type="number" min="0" max="100000" step="1" value="10" title="Discards short isolated contour fragments. Increase it to suppress speckles and texture noise.">
+                </div>
             </div>
         </div>
-        <div class="form-group">
-            <label for="smoothingPasses">Contour smoothing passes</label>
-            <input id="smoothingPasses" type="number" min="0" max="3" step="1" value="1" title="Rounds pixel stair-steps using Chaikin smoothing. Zero preserves sharper corners; higher values produce softer contours.">
+
+        <div id="hatchOptions" class="mode-options">
+            <h2>Hatch Settings</h2>
+            <div class="form-group">
+                <label for="hatchSize">Hatch cell size (px)</label>
+                <input id="hatchSize" type="number" min="4" max="128" step="1" value="16" title="Brightness sampling cell size. Smaller cells retain more detail and create denser, more complex SVGs.">
+            </div>
+            <div class="row">
+                <div class="form-group">
+                    <label for="hatchLightThreshold">Light-tone threshold</label>
+                    <input id="hatchLightThreshold" type="number" min="1" max="254" step="1" value="160" title="Cells darker than this receive the first hatch stroke. Lower it to omit more light shading.">
+                </div>
+                <div class="form-group">
+                    <label for="hatchMidThreshold">Mid-tone threshold</label>
+                    <input id="hatchMidThreshold" type="number" min="0" max="254" step="1" value="96" title="Cells darker than this receive an additional diagonal stroke.">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="hatchDarkThreshold">Dark-tone threshold</label>
+                <input id="hatchDarkThreshold" type="number" min="0" max="254" step="1" value="40" title="Cells darker than this receive a second horizontal stroke for the highest density.">
+            </div>
+        </div>
+
+        <div class="checkbox-row">
+            <input id="sortStrokes" type="checkbox" checked>
+            <label for="sortStrokes">Optimize stroke order to reduce pen-up travel</label>
         </div>
         <div class="checkbox-row">
             <input id="invertImage" type="checkbox">
@@ -249,16 +272,16 @@
         </div>
         <div class="checkbox-row">
             <input id="whiteBackground" type="checkbox" checked>
-            <label for="whiteBackground">Composite transparency over white before analyzing brightness</label>
+            <label for="whiteBackground">Composite transparency over white before analysis</label>
         </div>
         <div class="form-group">
             <label for="workspaceMode">Open workspace in</label>
-            <select id="workspaceMode" title="The transferred SVG will explicitly select this toolpath generation mode. Outline Trace is recommended for silhouettes and edge outlines.">
-                <option value="outline" selected>Outline Trace</option>
-                <option value="outline-hatch">Outline then Hatch</option>
-                <option value="hatch">Brightness Hatch</option>
+            <select id="workspaceMode" title="Outline Trace follows the generated polylines exactly and is recommended for all converter outputs.">
+                <option value="outline" selected>Outline Trace — recommended</option>
+                <option value="outline-hatch">Outline then Hatch — adds another workspace hatch pass</option>
+                <option value="hatch">Brightness Hatch — reprocess SVG brightness</option>
             </select>
-            <div class="helper">This prevents converted artwork from silently opening in the previously saved hatch mode.</div>
+            <div class="helper">The converter already writes contour and hatch marks as SVG polylines. Outline Trace plots those marks exactly.</div>
         </div>
         <div class="buttons">
             <button id="previewBtn" type="button">Preview SVG</button>

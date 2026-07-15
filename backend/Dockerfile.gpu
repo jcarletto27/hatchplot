@@ -14,7 +14,7 @@ WORKDIR /app
 COPY requirements.txt requirements-gpu.txt ./
 RUN python3 -m pip install --no-cache-dir -r requirements-gpu.txt
 
-COPY main.py .
+COPY main.py linedraw_engine.py ./
 
 RUN useradd --create-home --uid 10001 appuser
 USER appuser

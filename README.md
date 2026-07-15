@@ -27,17 +27,18 @@ Hatch layouts include linear, spiral, concentric, and radial carriers. Waveforms
 
 Open **Image to SVG** from the HatchPlot header or visit `/converter.html`.
 
-The converter accepts browser-readable raster formats including PNG, JPEG, WebP, BMP, GIF, and AVIF. It provides:
+The converter accepts browser-readable raster formats including PNG, JPEG, WebP, BMP, GIF, and AVIF. It produces plotter-oriented, polyline-only SVG files with three modes:
 
-- posterized grayscale, monochrome silhouette, and stroked edge-contour tracing;
-- physical output width and trace-resolution controls;
-- grayscale levels or threshold controls;
-- blur, alpha threshold, despeckle, contour simplification, and smoothing;
-- source and generated-SVG previews;
-- SVG download; and
-- **Send to Toolpath Workspace**, with an explicit destination mode of Outline Trace, Outline then Hatch, or Brightness Hatch.
+- **Contours only** detects connected image edges and emits open or closed stroked polylines.
+- **Hatches only** converts grayscale into three ordered hatch-density bands.
+- **Contours + hatches** combines both passes, with contours listed before hatches.
 
-Conversion uses the backend OpenCV contour engine to remove small components, preserve holes, smooth contours, and simplify redundant points. The resulting file contains native SVG paths rather than an embedded or browser-rasterized image.
+Controls include physical output width, trace resolution, preview stroke width, automatic contrast, blur, alpha handling, Canny edge thresholds, contour simplification, minimum contour length, hatch cell size, three tonal thresholds, inversion, and stroke-order optimization. Previewed SVGs contain no embedded raster image and no filled pixel-cell regions.
+
+**Send to Toolpath Workspace** uses a short-lived backend transfer token rather than browser storage. The workspace consumes the generated SVG once and explicitly selects the requested generation mode. **Outline Trace** is recommended because converter output already contains the final contour and hatch polylines.
+
+The converter engine is a Python 3/OpenCV adaptation of the contour, hatch, and nearest-endpoint ordering concepts from Lingdong Huang's MIT-licensed `linedraw` project. Attribution and the license text are included in `THIRD_PARTY_NOTICES.md`.
+
 
 ## Start with CPU generation
 
@@ -86,7 +87,7 @@ docker compose -f compose.yml -f compose.gpu.yml logs -f backend
 
 The `.env` and Compose files expose the host ports, worker count, pending-job limit, upload and brightness-map limits, retained-result limit, job TTL, toolpath/path limits, logging level, acceleration backend, and default brightness cutoff.
 
-Jobs and completed results are held in backend memory. Restarting the backend clears them. Browser settings and converter transfers are stored only in the current browser profile and site origin.
+Jobs, completed results, and pending converter-transfer tokens are held in backend memory. Restarting the backend clears them. Browser settings remain local to the current browser profile and site origin.
 
 ## Troubleshooting
 

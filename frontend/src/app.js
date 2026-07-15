@@ -1544,7 +1544,46 @@ function openSvgTransferDatabase() {
     });
 }
 
+async function applyConvertedSvgRecord(record, requestedMode) {
+    if (!record?.svgText && !record?.svg) throw new Error('The transfer did not contain SVG data.');
+    const svgText = record.svgText || record.svg;
+    const filename = record.filename || 'converted-image.svg';
+    await loadSvgText(svgText, filename, 'Received');
+    const selectedMode = ['outline', 'outline-hatch', 'hatch'].includes(requestedMode)
+        ? requestedMode
+        : ['outline', 'outline-hatch', 'hatch'].includes(record.generationMode)
+            ? record.generationMode
+            : 'outline';
+    const modeSelect = document.getElementById('generationMode');
+    modeSelect.value = selectedMode;
+    modeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    document.getElementById('importSection')?.setAttribute('open', '');
+    document.getElementById('generateSection')?.setAttribute('open', '');
+    const modeLabel = modeSelect.options[modeSelect.selectedIndex]?.textContent || selectedMode;
+    generationStatus.textContent = `Received ${filename} and selected ${modeLabel}.`;
+}
+
 async function consumePendingConvertedSvg() {
+    const parameters = new URLSearchParams(window.location.search);
+    const serverTransferId = parameters.get('transfer');
+    if (serverTransferId) {
+        try {
+            generationStatus.textContent = 'Receiving converted SVG from the server...';
+            const response = await fetch(`/api/transfers/${encodeURIComponent(serverTransferId)}`, {
+                headers: { Accept: 'application/json' }
+            });
+            if (!response.ok) throw new Error(await readApiError(response));
+            const record = await response.json();
+            await applyConvertedSvgRecord(record, parameters.get('mode'));
+            window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+        } catch (error) {
+            console.warn('Unable to receive server-side converted artwork:', error);
+            generationStatus.textContent = `Unable to receive converted artwork: ${error.message}`;
+        }
+        return;
+    }
+
+    // Backward-compatible fallback for converter versions that used browser storage.
     let database;
     let record = null;
     const transferErrors = [];
@@ -1578,7 +1617,7 @@ async function consumePendingConvertedSvg() {
         }
 
         if (!record?.svgText) {
-            if (new URLSearchParams(window.location.search).get('from') === 'converter') {
+            if (parameters.get('from') === 'converter') {
                 generationStatus.textContent = transferErrors.length
                     ? `The converted SVG could not be received: ${transferErrors.join('; ')}`
                     : 'No converted SVG was found. Return to Image to SVG and use Send to Toolpath Workspace again.';
@@ -1586,17 +1625,7 @@ async function consumePendingConvertedSvg() {
             return;
         }
 
-        await loadSvgText(record.svgText, record.filename || 'converted-image.svg', 'Received');
-        const requestedMode = ['outline', 'outline-hatch', 'hatch'].includes(record.generationMode)
-            ? record.generationMode
-            : 'outline';
-        const modeSelect = document.getElementById('generationMode');
-        modeSelect.value = requestedMode;
-        modeSelect.dispatchEvent(new Event('change', { bubbles: true }));
-        document.getElementById('importSection')?.setAttribute('open', '');
-        document.getElementById('generateSection')?.setAttribute('open', '');
-        const modeLabel = modeSelect.options[modeSelect.selectedIndex]?.textContent || requestedMode;
-        generationStatus.textContent = `Received ${record.filename || 'converted-image.svg'} and selected ${modeLabel}.`;
+        await applyConvertedSvgRecord(record, record.generationMode);
         window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
     } catch (error) {
         console.warn('Unable to receive converted artwork:', error);
