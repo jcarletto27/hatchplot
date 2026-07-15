@@ -3,14 +3,16 @@
 const SVG_TRANSFER_DB = 'hatchplot-artwork-transfer-v1';
 const SVG_TRANSFER_STORE = 'pending-artwork';
 const SVG_TRANSFER_KEY = 'pending';
+const SVG_TRANSFER_FALLBACK_KEY = 'hatchplot.pendingArtwork.v1';
 
 const TRACE_MODE_HELP = {
-    posterize: 'Creates nested filled vector regions for several grayscale bands. This preserves tonal structure for brightness hatching while remaining valid vector geometry for outline tracing.',
-    silhouette: 'Creates one filled vector shape from pixels on one side of the luminance threshold. This is best for logos, high-contrast subjects, and simple line art.',
-    edges: 'Detects strong raster edges, expands them into connected filled shapes, and vectorizes those shapes. Use blur and a higher edge threshold to suppress texture noise.'
+    posterize: 'Creates nested, hierarchy-aware vector regions for several grayscale bands. Broad light regions are drawn first, then darker regions are layered above them.',
+    silhouette: 'Creates filled vector silhouettes with holes preserved. This is best for logos, high-contrast subjects, and solid artwork.',
+    edges: 'Detects strong image edges and emits native stroked SVG contours. Use blur and a higher edge threshold to suppress texture and compression noise.'
 };
 
 let sourceImage = null;
+let sourceFile = null;
 let sourceFilename = 'converted-image.png';
 let generatedSvg = '';
 let generatedFilename = 'converted-image.svg';
@@ -25,6 +27,7 @@ const metadataNode = document.getElementById('metadata');
 const previewButton = document.getElementById('previewBtn');
 const downloadButton = document.getElementById('downloadBtn');
 const sendButton = document.getElementById('sendBtn');
+const workspaceMode = document.getElementById('workspaceMode');
 
 function clamp(value, minimum, maximum) {
     return Math.max(minimum, Math.min(maximum, value));
@@ -94,6 +97,7 @@ async function loadImageFile(file) {
             image.src = objectUrl;
         });
         sourceImage = image;
+        sourceFile = file;
         sourceFilename = file.name || 'converted-image.png';
         generatedSvg = '';
         generatedFilename = `${safeBaseName(sourceFilename)}.svg`;
@@ -506,24 +510,60 @@ function generateSvg(settings, raster) {
     };
 }
 
+async function readApiError(response) {
+    try {
+        const payload = await response.json();
+        if (typeof payload?.detail === 'string') return payload.detail;
+        if (typeof payload?.error === 'string') return payload.error;
+    } catch (_error) {
+        // Fall through to the status text.
+    }
+    return `${response.status} ${response.statusText}`.trim();
+}
+
+function buildVectorizeFormData(settings) {
+    const formData = new FormData();
+    formData.append('file', sourceFile, sourceFilename);
+    formData.append('mode', settings.mode);
+    formData.append('outputWidth', String(settings.outputWidth));
+    formData.append('maxDimension', String(settings.maxDimension));
+    formData.append('grayLevels', String(settings.grayLevels));
+    formData.append('lumaThreshold', String(settings.lumaThreshold));
+    formData.append('edgeThreshold', String(settings.edgeThreshold));
+    formData.append('edgeWidth', String(settings.edgeWidth));
+    formData.append('blurRadius', String(settings.blurRadius));
+    formData.append('alphaThreshold', String(settings.alphaThreshold));
+    formData.append('despeckleArea', String(settings.despeckleArea));
+    formData.append('simplifyTolerance', String(settings.simplifyTolerance));
+    formData.append('smoothingPasses', String(settings.smoothingPasses));
+    formData.append('invert', settings.invert ? 'true' : 'false');
+    formData.append('whiteBackground', settings.whiteBackground ? 'true' : 'false');
+    return formData;
+}
+
 async function previewConversion() {
-    if (!sourceImage) {
+    if (!sourceImage || !sourceFile) {
         alert('Choose an image first.');
         return;
     }
-    setBusy(true, 'Analyzing the image and tracing vector contours...');
-    await new Promise(resolve => window.setTimeout(resolve, 20));
+    setBusy(true, 'Uploading the image and tracing smooth vector contours...');
     try {
         const settings = readSettings();
-        const raster = renderAnalysisRaster(settings);
-        const result = generateSvg(settings, raster);
+        const response = await fetch('/api/vectorize', {
+            method: 'POST',
+            body: buildVectorizeFormData(settings),
+            headers: { Accept: 'application/json' }
+        });
+        if (!response.ok) throw new Error(await readApiError(response));
+        const result = await response.json();
+        if (!result?.svg || !result?.stats) throw new Error('The vectorization service returned an incomplete result.');
+
         generatedSvg = result.svg;
         generatedFilename = `${safeBaseName(sourceFilename)}-${settings.mode}.svg`;
-        const { svg: _svgText, ...traceStats } = result;
-        lastTraceStats = traceStats;
+        lastTraceStats = result.stats;
         svgPreview.innerHTML = generatedSvg;
-        metadataNode.textContent = `${result.rasterWidth.toLocaleString()} × ${result.rasterHeight.toLocaleString()} trace raster · ${result.pathCount.toLocaleString()} closed vector regions · ${result.pointCount.toLocaleString()} contour points · ${settings.outputWidth.toFixed(1)} × ${result.outputHeight.toFixed(1)} mm`;
-        statusNode.textContent = `SVG preview ready. Download it or send it directly to the HatchPlot toolpath workspace.`;
+        metadataNode.textContent = `${Number(result.stats.trace_width).toLocaleString()} × ${Number(result.stats.trace_height).toLocaleString()} trace raster · ${Number(result.stats.path_count).toLocaleString()} vector paths · ${Number(result.stats.point_count).toLocaleString()} contour points · ${Number(result.stats.output_width_mm).toFixed(1)} × ${Number(result.stats.output_height_mm).toFixed(1)} mm · OpenCV contour engine`;
+        statusNode.textContent = 'SVG preview ready. The result contains native SVG paths and can be downloaded or sent directly to the toolpath workspace.';
     } catch (error) {
         generatedSvg = '';
         lastTraceStats = null;
@@ -570,22 +610,42 @@ function openTransferDatabase() {
 async function sendToWorkspace() {
     if (!generatedSvg) return;
     setBusy(true, 'Saving the SVG for the toolpath workspace...');
+    const record = {
+        svgText: generatedSvg,
+        filename: generatedFilename,
+        createdAt: Date.now(),
+        stats: lastTraceStats,
+        generationMode: workspaceMode?.value || 'outline'
+    };
     let database;
+    let stored = false;
+    const storageErrors = [];
     try {
-        database = await openTransferDatabase();
-        await new Promise((resolve, reject) => {
-            const transaction = database.transaction(SVG_TRANSFER_STORE, 'readwrite');
-            transaction.objectStore(SVG_TRANSFER_STORE).put({
-                svgText: generatedSvg,
-                filename: generatedFilename,
-                createdAt: Date.now(),
-                stats: lastTraceStats
-            }, SVG_TRANSFER_KEY);
-            transaction.oncomplete = resolve;
-            transaction.onerror = () => reject(transaction.error || new Error('Unable to store the converted SVG.'));
-            transaction.onabort = () => reject(transaction.error || new Error('The SVG transfer was aborted.'));
-        });
-        window.location.href = '/';
+        try {
+            database = await openTransferDatabase();
+            await new Promise((resolve, reject) => {
+                const transaction = database.transaction(SVG_TRANSFER_STORE, 'readwrite');
+                transaction.objectStore(SVG_TRANSFER_STORE).put(record, SVG_TRANSFER_KEY);
+                transaction.oncomplete = resolve;
+                transaction.onerror = () => reject(transaction.error || new Error('Unable to store the converted SVG.'));
+                transaction.onabort = () => reject(transaction.error || new Error('The SVG transfer was aborted.'));
+            });
+            stored = true;
+        } catch (error) {
+            storageErrors.push(`IndexedDB: ${error.message}`);
+        }
+
+        try {
+            sessionStorage.setItem(SVG_TRANSFER_FALLBACK_KEY, JSON.stringify(record));
+            stored = true;
+        } catch (error) {
+            storageErrors.push(`sessionStorage: ${error.message}`);
+        }
+
+        if (!stored) throw new Error(storageErrors.join('; ') || 'Browser storage is unavailable.');
+        const workspaceUrl = new URL('./', window.location.href);
+        workspaceUrl.searchParams.set('from', 'converter');
+        window.location.assign(workspaceUrl.href);
     } catch (error) {
         statusNode.textContent = `Unable to send the SVG: ${error.message}`;
         setBusy(false);
@@ -602,6 +662,7 @@ imageInput.addEventListener('change', async event => {
         await loadImageFile(file);
     } catch (error) {
         sourceImage = null;
+        sourceFile = null;
         statusNode.textContent = `Unable to load the image: ${error.message}`;
         setBusy(false);
     }

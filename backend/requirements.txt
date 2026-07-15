@@ -5,3 +5,4 @@ shapely>=2.0,<3
 svgelements>=1.9,<2
 Pillow>=10,<13
 numpy>=1.26,<3
+opencv-python-headless>=4.10,<5

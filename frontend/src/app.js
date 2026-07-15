@@ -13,6 +13,7 @@ let layerEntries = [];
 let machineBed = null;
 let originMarker = null;
 let activeJobId = null;
+let activeGenerationMode = null;
 let cancelRequested = false;
 let previewSvgLoadToken = 0;
 
@@ -41,6 +42,7 @@ const UI_SETTINGS_KEY = 'hatchPlotter.uiSettings.v1';
 const SVG_TRANSFER_DB = 'hatchplot-artwork-transfer-v1';
 const SVG_TRANSFER_STORE = 'pending-artwork';
 const SVG_TRANSFER_KEY = 'pending';
+const SVG_TRANSFER_FALLBACK_KEY = 'hatchplot.pendingArtwork.v1';
 const FIT_MARGIN = 0.9;
 const MM_PER_CSS_PIXEL = 25.4 / 96;
 const MAX_BRIGHTNESS_MAP_DIMENSION = 4096;
@@ -1544,27 +1546,61 @@ function openSvgTransferDatabase() {
 
 async function consumePendingConvertedSvg() {
     let database;
+    let record = null;
+    const transferErrors = [];
     try {
-        database = await openSvgTransferDatabase();
-        const record = await new Promise((resolve, reject) => {
-            const transaction = database.transaction(SVG_TRANSFER_STORE, 'readwrite');
-            const store = transaction.objectStore(SVG_TRANSFER_STORE);
-            const request = store.get(SVG_TRANSFER_KEY);
-            let value = null;
-            request.onsuccess = () => {
-                value = request.result || null;
-                if (value) store.delete(SVG_TRANSFER_KEY);
-            };
-            request.onerror = () => reject(request.error || new Error('Unable to read the transferred SVG.'));
-            transaction.oncomplete = () => resolve(value);
-            transaction.onerror = () => reject(transaction.error || new Error('Unable to clear the transferred SVG.'));
-            transaction.onabort = () => reject(transaction.error || new Error('The transferred SVG could not be consumed.'));
-        });
-        if (!record?.svgText) return;
+        try {
+            database = await openSvgTransferDatabase();
+            record = await new Promise((resolve, reject) => {
+                const transaction = database.transaction(SVG_TRANSFER_STORE, 'readwrite');
+                const store = transaction.objectStore(SVG_TRANSFER_STORE);
+                const request = store.get(SVG_TRANSFER_KEY);
+                let value = null;
+                request.onsuccess = () => {
+                    value = request.result || null;
+                    if (value) store.delete(SVG_TRANSFER_KEY);
+                };
+                request.onerror = () => reject(request.error || new Error('Unable to read the transferred SVG.'));
+                transaction.oncomplete = () => resolve(value);
+                transaction.onerror = () => reject(transaction.error || new Error('Unable to clear the transferred SVG.'));
+                transaction.onabort = () => reject(transaction.error || new Error('The transferred SVG could not be consumed.'));
+            });
+        } catch (error) {
+            transferErrors.push(`IndexedDB: ${error.message}`);
+        }
+
+        try {
+            const fallbackText = sessionStorage.getItem(SVG_TRANSFER_FALLBACK_KEY);
+            if (!record && fallbackText) record = JSON.parse(fallbackText);
+            sessionStorage.removeItem(SVG_TRANSFER_FALLBACK_KEY);
+        } catch (error) {
+            transferErrors.push(`sessionStorage: ${error.message}`);
+        }
+
+        if (!record?.svgText) {
+            if (new URLSearchParams(window.location.search).get('from') === 'converter') {
+                generationStatus.textContent = transferErrors.length
+                    ? `The converted SVG could not be received: ${transferErrors.join('; ')}`
+                    : 'No converted SVG was found. Return to Image to SVG and use Send to Toolpath Workspace again.';
+            }
+            return;
+        }
+
         await loadSvgText(record.svgText, record.filename || 'converted-image.svg', 'Received');
+        const requestedMode = ['outline', 'outline-hatch', 'hatch'].includes(record.generationMode)
+            ? record.generationMode
+            : 'outline';
+        const modeSelect = document.getElementById('generationMode');
+        modeSelect.value = requestedMode;
+        modeSelect.dispatchEvent(new Event('change', { bubbles: true }));
         document.getElementById('importSection')?.setAttribute('open', '');
+        document.getElementById('generateSection')?.setAttribute('open', '');
+        const modeLabel = modeSelect.options[modeSelect.selectedIndex]?.textContent || requestedMode;
+        generationStatus.textContent = `Received ${record.filename || 'converted-image.svg'} and selected ${modeLabel}.`;
+        window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
     } catch (error) {
         console.warn('Unable to receive converted artwork:', error);
+        generationStatus.textContent = `Unable to receive converted artwork: ${error.message}`;
     } finally {
         if (database) database.close();
     }
@@ -1701,6 +1737,8 @@ function showJobProgress(job) {
 function updateGenerationButtons(isGenerating, canCancel = false) {
     generateButton.disabled = isGenerating;
     cancelGenerateButton.disabled = !(isGenerating && canCancel);
+    const modeSelect = document.getElementById('generationMode');
+    if (modeSelect) modeSelect.disabled = isGenerating;
 }
 
 function clearLoading() {
@@ -2147,6 +2185,7 @@ generateButton.addEventListener('click', async function() {
     try {
         const penThickness = ensurePenThickness();
         const generationMode = document.getElementById('generationMode').value;
+        activeGenerationMode = generationMode;
         setLoading(
             generationMode === 'outline'
                 ? 'Preparing SVG vector geometry for outline tracing...'
@@ -2192,6 +2231,10 @@ generateButton.addEventListener('click', async function() {
         if (!resultResponse.ok) throw new Error(await readApiError(resultResponse));
 
         const data = await resultResponse.json();
+        const returnedMode = data?.stats?.generation_mode;
+        if (returnedMode && activeGenerationMode && returnedMode !== activeGenerationMode) {
+            throw new Error(`Generation mode mismatch: requested ${activeGenerationMode}, but the backend returned ${returnedMode}.`);
+        }
         displayGeneratedResult(data);
     } catch (error) {
         console.error('Failed to generate G-code:', error);
@@ -2202,6 +2245,7 @@ generateButton.addEventListener('click', async function() {
         if (!cancelled) alert(`Unable to generate the toolpath:\n\n${error.message}`);
     } finally {
         activeJobId = null;
+        activeGenerationMode = null;
         cancelRequested = false;
         clearLoading();
         syncSourceSvgVisibility();

@@ -16,6 +16,7 @@ from concurrent.futures.process import BrokenProcessPool
 from contextlib import asynccontextmanager
 from typing import Any, Iterable, MutableMapping
 
+import cv2
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
@@ -2060,6 +2061,313 @@ async def _read_brightness_map(file: UploadFile | None) -> bytes | None:
         )
     return content
 
+
+def _vector_number(value: float) -> str:
+    rounded = round(float(value), 3)
+    if abs(rounded - round(rounded)) < 1e-9:
+        return str(int(round(rounded)))
+    return f"{rounded:.3f}".rstrip("0").rstrip(".")
+
+
+def _chaikin_ring(points: np.ndarray, passes: int) -> np.ndarray:
+    ring = np.asarray(points, dtype=np.float64)
+    if ring.ndim != 2 or ring.shape[0] < 3:
+        return ring
+    for _ in range(max(0, int(passes))):
+        following = np.roll(ring, -1, axis=0)
+        first = (ring * 0.75) + (following * 0.25)
+        second = (ring * 0.25) + (following * 0.75)
+        expanded = np.empty((ring.shape[0] * 2, 2), dtype=np.float64)
+        expanded[0::2] = first
+        expanded[1::2] = second
+        ring = expanded
+    return ring
+
+
+def _remove_small_components(mask: np.ndarray, minimum_area: float) -> np.ndarray:
+    binary = np.where(mask > 0, 255, 0).astype(np.uint8)
+    if minimum_area <= 0:
+        return binary
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary)
+    for label in range(1, count):
+        if float(stats[label, cv2.CC_STAT_AREA]) >= minimum_area:
+            cleaned[labels == label] = 255
+    return cleaned
+
+
+def _contour_path_data(
+    mask: np.ndarray,
+    *,
+    minimum_area: float,
+    simplify_tolerance: float,
+    smoothing_passes: int,
+) -> tuple[str, int, int]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return "", 0, 0
+
+    kept: list[np.ndarray] = []
+    point_count = 0
+    for contour in contours:
+        area = abs(float(cv2.contourArea(contour)))
+        if area < max(0.5, minimum_area):
+            continue
+        points = contour.reshape(-1, 2).astype(np.float64)
+        if points.shape[0] < 3:
+            continue
+        points = _chaikin_ring(points, smoothing_passes)
+        if simplify_tolerance > 0 and points.shape[0] >= 3:
+            approximated = cv2.approxPolyDP(
+                points.reshape(-1, 1, 2).astype(np.float32),
+                float(simplify_tolerance),
+                True,
+            )
+            if approximated is not None and len(approximated) >= 3:
+                points = approximated.reshape(-1, 2).astype(np.float64)
+        if points.shape[0] < 3:
+            continue
+        kept.append(points)
+        point_count += int(points.shape[0])
+
+    commands: list[str] = []
+    for points in kept:
+        first = points[0]
+        commands.append(f"M{_vector_number(first[0])} {_vector_number(first[1])}")
+        for point in points[1:]:
+            commands.append(f"L{_vector_number(point[0])} {_vector_number(point[1])}")
+        commands.append("Z")
+    return "".join(commands), len(kept), point_count
+
+
+def _edge_path_data(
+    edges: np.ndarray,
+    *,
+    minimum_length: float,
+    simplify_tolerance: float,
+    smoothing_passes: int,
+) -> tuple[str, int, int]:
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    commands: list[str] = []
+    path_count = 0
+    point_count = 0
+    for contour in contours:
+        if float(cv2.arcLength(contour, False)) < max(2.0, minimum_length):
+            continue
+        points = contour.reshape(-1, 2).astype(np.float64)
+        if points.shape[0] < 2:
+            continue
+        if smoothing_passes > 0 and points.shape[0] >= 3:
+            # Edge contours are closed by OpenCV. Smooth as a ring, then emit a closed path.
+            points = _chaikin_ring(points, smoothing_passes)
+        if simplify_tolerance > 0:
+            approximated = cv2.approxPolyDP(
+                points.reshape(-1, 1, 2).astype(np.float32),
+                float(simplify_tolerance),
+                True,
+            )
+            if approximated is not None and len(approximated) >= 2:
+                points = approximated.reshape(-1, 2).astype(np.float64)
+        if points.shape[0] < 2:
+            continue
+        first = points[0]
+        commands.append(f"M{_vector_number(first[0])} {_vector_number(first[1])}")
+        for point in points[1:]:
+            commands.append(f"L{_vector_number(point[0])} {_vector_number(point[1])}")
+        commands.append("Z")
+        path_count += 1
+        point_count += int(points.shape[0])
+    return "".join(commands), path_count, point_count
+
+
+def vectorize_raster_image(content: bytes, filename: str, settings: dict[str, Any]) -> dict[str, Any]:
+    try:
+        with Image.open(io.BytesIO(content)) as source:
+            source.load()
+            rgba_image = source.convert("RGBA")
+    except (UnidentifiedImageError, OSError) as exc:
+        raise GenerationError("The uploaded file is not a readable raster image.") from exc
+
+    source_width, source_height = rgba_image.size
+    if source_width < 1 or source_height < 1:
+        raise GenerationError("The source image has invalid dimensions.")
+    if source_width * source_height > MAX_BRIGHTNESS_MAP_PIXELS:
+        raise GenerationLimitError(
+            f"The source image contains more than {MAX_BRIGHTNESS_MAP_PIXELS:,} pixels."
+        )
+
+    mode = str(settings.get("mode", "posterize"))
+    if mode not in {"posterize", "silhouette", "edges"}:
+        raise GenerationError("Trace mode must be posterize, silhouette, or edges.")
+
+    output_width = max(1.0, min(5000.0, float(settings.get("outputWidth", 150.0))))
+    maximum_dimension = max(128, min(4096, int(settings.get("maxDimension", 900))))
+    scale = min(1.0, maximum_dimension / max(source_width, source_height))
+    trace_width = max(1, int(round(source_width * scale)))
+    trace_height = max(1, int(round(source_height * scale)))
+    if (trace_width, trace_height) != rgba_image.size:
+        rgba_image = rgba_image.resize((trace_width, trace_height), Image.Resampling.LANCZOS)
+
+    rgba = np.asarray(rgba_image, dtype=np.uint8)
+    alpha = rgba[:, :, 3]
+    alpha_threshold = max(0, min(255, int(settings.get("alphaThreshold", 16))))
+    valid_alpha = alpha >= alpha_threshold
+    rgb = rgba[:, :, :3].astype(np.float32)
+    if bool(settings.get("whiteBackground", True)):
+        alpha_fraction = (alpha.astype(np.float32) / 255.0)[:, :, None]
+        rgb = (rgb * alpha_fraction) + (255.0 * (1.0 - alpha_fraction))
+    gray = cv2.cvtColor(np.clip(rgb, 0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    if bool(settings.get("invert", False)):
+        gray = 255 - gray
+
+    blur_radius = max(0, min(12, int(settings.get("blurRadius", 1))))
+    if blur_radius > 0:
+        kernel = (blur_radius * 2) + 1
+        gray = cv2.GaussianBlur(gray, (kernel, kernel), 0)
+
+    minimum_area = max(0.0, min(1_000_000.0, float(settings.get("despeckleArea", 12.0))))
+    simplify = max(0.0, min(32.0, float(settings.get("simplifyTolerance", 0.8))))
+    smoothing = max(0, min(4, int(settings.get("smoothingPasses", 1))))
+    output_height = output_width * (trace_height / trace_width)
+    groups: list[str] = []
+    total_paths = 0
+    total_points = 0
+
+    if mode == "posterize":
+        levels = max(2, min(12, int(settings.get("grayLevels", 4))))
+        # Paint the broad light region first, then progressively darker nested regions.
+        for band in range(levels):
+            threshold = int(round(254 - (band * (254 / max(1, levels - 1)))))
+            fill_value = max(0, min(255, int(round(255 * ((levels - band - 1) / levels)))))
+            mask = np.where(valid_alpha & (gray <= threshold), 255, 0).astype(np.uint8)
+            mask = _remove_small_components(mask, minimum_area)
+            path_data, path_count, point_count = _contour_path_data(
+                mask,
+                minimum_area=minimum_area,
+                simplify_tolerance=simplify,
+                smoothing_passes=smoothing,
+            )
+            if not path_data:
+                continue
+            groups.append(
+                f'<g id="tone-{band + 1}" data-threshold="{threshold}" fill="rgb({fill_value},{fill_value},{fill_value})" '
+                f'stroke="none" fill-rule="evenodd"><path d="{path_data}"/></g>'
+            )
+            total_paths += path_count
+            total_points += point_count
+    elif mode == "silhouette":
+        threshold = max(0, min(255, int(settings.get("lumaThreshold", 160))))
+        mask = np.where(valid_alpha & (gray <= threshold), 255, 0).astype(np.uint8)
+        mask = _remove_small_components(mask, minimum_area)
+        # Close one-pixel cracks without materially expanding the silhouette.
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        path_data, total_paths, total_points = _contour_path_data(
+            mask,
+            minimum_area=minimum_area,
+            simplify_tolerance=simplify,
+            smoothing_passes=smoothing,
+        )
+        if path_data:
+            groups.append(
+                f'<g id="silhouette" fill="#000000" stroke="none" fill-rule="evenodd"><path d="{path_data}"/></g>'
+            )
+    else:
+        threshold = max(1, min(255, int(settings.get("edgeThreshold", 70))))
+        edge_width = max(1, min(12, int(settings.get("edgeWidth", 2))))
+        edges = cv2.Canny(gray, threshold, min(255, max(threshold + 1, threshold * 3)), L2gradient=True)
+        edges[~valid_alpha] = 0
+        if edge_width > 1:
+            kernel = np.ones((edge_width, edge_width), np.uint8)
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        path_data, total_paths, total_points = _edge_path_data(
+            edges,
+            minimum_length=max(2.0, math.sqrt(max(1.0, minimum_area)) * 2.0),
+            simplify_tolerance=simplify,
+            smoothing_passes=smoothing,
+        )
+        if path_data:
+            stroke_width = max(0.35, edge_width * 0.55)
+            groups.append(
+                f'<g id="edges" fill="none" stroke="#000000" stroke-width="{_vector_number(stroke_width)}" '
+                f'stroke-linejoin="round" stroke-linecap="round"><path d="{path_data}"/></g>'
+            )
+
+    if not total_paths or not groups:
+        raise GenerationError(
+            "No usable vector paths survived these settings. Reduce despeckling or simplification, adjust the threshold, or invert the image."
+        )
+
+    safe_title = (filename or "converted-image").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    svg = "\n".join([
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{output_width:.4f}mm" height="{output_height:.4f}mm" viewBox="0 0 {trace_width} {trace_height}">',
+        f'<title>{safe_title} converted by HatchPlot</title>',
+        f'<metadata>mode={mode}; trace={trace_width}x{trace_height}; simplify={simplify}; smoothing={smoothing}</metadata>',
+        *groups,
+        '</svg>',
+    ])
+    return {
+        "svg": svg,
+        "stats": {
+            "mode": mode,
+            "source_width": source_width,
+            "source_height": source_height,
+            "trace_width": trace_width,
+            "trace_height": trace_height,
+            "output_width_mm": round(output_width, 4),
+            "output_height_mm": round(output_height, 4),
+            "path_count": total_paths,
+            "point_count": total_points,
+            "engine": "opencv-contours",
+        },
+    }
+
+
+@app.post("/vectorize")
+async def vectorize_image(
+    file: UploadFile = File(...),
+    mode: str = Form("posterize"),
+    outputWidth: float = Form(150.0),
+    maxDimension: int = Form(900),
+    grayLevels: int = Form(4),
+    lumaThreshold: int = Form(160),
+    edgeThreshold: int = Form(70),
+    edgeWidth: int = Form(2),
+    blurRadius: int = Form(1),
+    alphaThreshold: int = Form(16),
+    despeckleArea: float = Form(12.0),
+    simplifyTolerance: float = Form(0.8),
+    smoothingPasses: int = Form(1),
+    invert: bool = Form(False),
+    whiteBackground: bool = Form(True),
+):
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    filename = file.filename or "converted-image"
+    await file.close()
+    if not content:
+        raise HTTPException(status_code=422, detail="The uploaded image is empty.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"The image exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
+    settings = {
+        "mode": mode,
+        "outputWidth": outputWidth,
+        "maxDimension": maxDimension,
+        "grayLevels": grayLevels,
+        "lumaThreshold": lumaThreshold,
+        "edgeThreshold": edgeThreshold,
+        "edgeWidth": edgeWidth,
+        "blurRadius": blurRadius,
+        "alphaThreshold": alphaThreshold,
+        "despeckleArea": despeckleArea,
+        "simplifyTolerance": simplifyTolerance,
+        "smoothingPasses": smoothingPasses,
+        "invert": invert,
+        "whiteBackground": whiteBackground,
+    }
+    try:
+        return vectorize_raster_image(content, filename, settings)
+    except GenerationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 @app.get("/health")
 def health() -> dict[str, Any]:

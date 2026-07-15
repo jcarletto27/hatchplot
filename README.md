@@ -29,15 +29,15 @@ Open **Image to SVG** from the HatchPlot header or visit `/converter.html`.
 
 The converter accepts browser-readable raster formats including PNG, JPEG, WebP, BMP, GIF, and AVIF. It provides:
 
-- posterized grayscale, monochrome silhouette, and edge-shape tracing;
+- posterized grayscale, monochrome silhouette, and stroked edge-contour tracing;
 - physical output width and trace-resolution controls;
 - grayscale levels or threshold controls;
 - blur, alpha threshold, despeckle, contour simplification, and smoothing;
 - source and generated-SVG previews;
 - SVG download; and
-- **Send to Toolpath Workspace**, which transfers the generated SVG directly into the main HatchPlot workspace.
+- **Send to Toolpath Workspace**, with an explicit destination mode of Outline Trace, Outline then Hatch, or Brightness Hatch.
 
-Conversion runs locally in the browser. The source raster is not uploaded to the backend.
+Conversion uses the backend OpenCV contour engine to remove small components, preserve holes, smooth contours, and simplify redundant points. The resulting file contains native SVG paths rather than an embedded or browser-rasterized image.
 
 ## Start with CPU generation
 

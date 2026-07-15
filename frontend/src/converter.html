@@ -165,7 +165,7 @@
     <div class="mark">HP</div>
     <div>
         <h1>HatchPlot Image to SVG</h1>
-        <p>Convert PNG, JPEG, WebP, BMP, GIF, and other browser-readable images into traceable SVG artwork.</p>
+        <p>Convert standard raster images into smooth, native SVG paths for outline tracing or brightness hatching.</p>
     </div>
     <a class="back-link" href="/">Toolpath Workspace</a>
 </header>
@@ -181,7 +181,7 @@
             <select id="traceMode" title="Posterized fills preserve grayscale bands, Monochrome creates one filled silhouette, and Edge shapes isolate strong image edges.">
                 <option value="posterize">Posterized grayscale fills</option>
                 <option value="silhouette">Monochrome silhouette</option>
-                <option value="edges">Edge shapes</option>
+                <option value="edges">Edge outlines</option>
             </select>
             <div id="traceModeHelp" class="helper"></div>
         </div>
@@ -192,7 +192,7 @@
             </div>
             <div class="form-group">
                 <label for="maxDimension">Trace resolution (px)</label>
-                <input id="maxDimension" type="number" min="128" max="2048" step="32" value="900" title="Maximum raster dimension used for tracing. Higher values retain more detail but generate larger SVGs and take longer.">
+                <input id="maxDimension" type="number" min="128" max="4096" step="32" value="900" title="Maximum raster dimension used for tracing. Higher values retain more detail but generate larger SVGs and take longer.">
             </div>
         </div>
         <div id="posterizeOptions" class="mode-options">
@@ -250,6 +250,15 @@
         <div class="checkbox-row">
             <input id="whiteBackground" type="checkbox" checked>
             <label for="whiteBackground">Composite transparency over white before analyzing brightness</label>
+        </div>
+        <div class="form-group">
+            <label for="workspaceMode">Open workspace in</label>
+            <select id="workspaceMode" title="The transferred SVG will explicitly select this toolpath generation mode. Outline Trace is recommended for silhouettes and edge outlines.">
+                <option value="outline" selected>Outline Trace</option>
+                <option value="outline-hatch">Outline then Hatch</option>
+                <option value="hatch">Brightness Hatch</option>
+            </select>
+            <div class="helper">This prevents converted artwork from silently opening in the previously saved hatch mode.</div>
         </div>
         <div class="buttons">
             <button id="previewBtn" type="button">Preview SVG</button>
