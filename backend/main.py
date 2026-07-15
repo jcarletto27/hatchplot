@@ -34,7 +34,7 @@ from shapely.geometry import (
     box,
 )
 from shapely.validation import make_valid
-from svgelements import Color, Path, SVG, Shape
+from svgelements import Arc, Close, Color, CubicBezier, Line, Move, Path, QuadraticBezier, SVG, Shape
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -209,28 +209,145 @@ def _iter_lines(geometry: Any) -> Iterable[LineString]:
             yield from _iter_lines(item)
 
 
+def _point_xy(point: Any) -> tuple[float, float] | None:
+    if point is None:
+        return None
+    try:
+        x = float(point.x)
+        y = float(point.y)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    return (x, y)
+
+
+def _point_line_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    denominator = (dx * dx) + (dy * dy)
+    if denominator <= 1e-18:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    projection = ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / denominator
+    nearest_x = start[0] + (projection * dx)
+    nearest_y = start[1] + (projection * dy)
+    return math.hypot(point[0] - nearest_x, point[1] - nearest_y)
+
+
+def _append_unique(points: list[tuple[float, float]], point: tuple[float, float] | None) -> None:
+    if point is None:
+        return
+    if not points or point != points[-1]:
+        points.append(point)
+
+
+def _flatten_cubic(
+    start: tuple[float, float],
+    control1: tuple[float, float],
+    control2: tuple[float, float],
+    end: tuple[float, float],
+    tolerance: float,
+    points: list[tuple[float, float]],
+) -> None:
+    """Flatten a cubic Bezier without expensive numerical length integration."""
+    stack = [(start, control1, control2, end, 0)]
+    maximum_depth = 14
+    while stack:
+        p0, p1, p2, p3, depth = stack.pop()
+        flatness = max(
+            _point_line_distance(p1, p0, p3),
+            _point_line_distance(p2, p0, p3),
+        )
+        if flatness <= tolerance or depth >= maximum_depth:
+            _append_unique(points, p3)
+            continue
+
+        p01 = ((p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5)
+        p12 = ((p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5)
+        p23 = ((p2[0] + p3[0]) * 0.5, (p2[1] + p3[1]) * 0.5)
+        p012 = ((p01[0] + p12[0]) * 0.5, (p01[1] + p12[1]) * 0.5)
+        p123 = ((p12[0] + p23[0]) * 0.5, (p12[1] + p23[1]) * 0.5)
+        midpoint = ((p012[0] + p123[0]) * 0.5, (p012[1] + p123[1]) * 0.5)
+        stack.append((midpoint, p123, p23, p3, depth + 1))
+        stack.append((p0, p01, p012, midpoint, depth + 1))
+
+
+def _flatten_quadratic(
+    start: tuple[float, float],
+    control: tuple[float, float],
+    end: tuple[float, float],
+    tolerance: float,
+    points: list[tuple[float, float]],
+) -> None:
+    stack = [(start, control, end, 0)]
+    maximum_depth = 14
+    while stack:
+        p0, p1, p2, depth = stack.pop()
+        if _point_line_distance(p1, p0, p2) <= tolerance or depth >= maximum_depth:
+            _append_unique(points, p2)
+            continue
+        p01 = ((p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5)
+        p12 = ((p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5)
+        midpoint = ((p01[0] + p12[0]) * 0.5, (p01[1] + p12[1]) * 0.5)
+        stack.append((midpoint, p12, p2, depth + 1))
+        stack.append((p0, p01, midpoint, depth + 1))
+
+
 def path_to_centerlines(element: Path, sample_step: float) -> list[LineString]:
-    """Sample native SVG segments while preserving their exact vertices."""
+    """Flatten native SVG segments using geometric error rather than point spacing.
+
+    The previous implementation called ``segment.length()`` for every Bezier.
+    svgelements evaluates that length using numerical integration, which becomes
+    extremely expensive for traced SVGs containing tens of thousands of curves.
+    Adaptive subdivision preserves visible curve detail while avoiding those
+    integrations and omitting redundant points along nearly straight segments.
+    """
     lines: list[LineString] = []
-    safe_step = max(0.01, float(sample_step))
+    # sample_step historically represented desired point spacing. A quarter of
+    # that value is a conservative maximum curve-to-chord deviation.
+    tolerance = max(0.0025, float(sample_step) * 0.25)
     for raw_subpath in element.as_subpaths():
         subpath = Path(raw_subpath)
         points: list[tuple[float, float]] = []
         for segment in subpath:
+            if isinstance(segment, Move):
+                _append_unique(points, _point_xy(segment.end))
+                continue
+            if isinstance(segment, (Line, Close)):
+                _append_unique(points, _point_xy(segment.end))
+                continue
+            if isinstance(segment, CubicBezier):
+                start = _point_xy(segment.start)
+                control1 = _point_xy(segment.control1)
+                control2 = _point_xy(segment.control2)
+                end = _point_xy(segment.end)
+                if None not in (start, control1, control2, end):
+                    _append_unique(points, start)
+                    _flatten_cubic(start, control1, control2, end, tolerance, points)
+                continue
+            if isinstance(segment, QuadraticBezier):
+                start = _point_xy(segment.start)
+                control = _point_xy(segment.control)
+                end = _point_xy(segment.end)
+                if None not in (start, control, end):
+                    _append_unique(points, start)
+                    _flatten_quadratic(start, control, end, tolerance, points)
+                continue
+
+            # Arcs and uncommon custom segments retain a small generic fallback.
             try:
                 segment_length = float(segment.length())
             except (AttributeError, TypeError, ValueError):
                 continue
             if not math.isfinite(segment_length) or segment_length <= 0.0:
                 continue
-            sample_count = max(1, min(20_000, int(math.ceil(segment_length / safe_step))))
+            sample_count = max(1, min(4096, int(math.ceil(segment_length / max(sample_step, 0.01)))))
             for index in range(sample_count + 1):
-                point = segment.point(index / sample_count)
-                if not (math.isfinite(point.x) and math.isfinite(point.y)):
-                    continue
-                coordinate = (float(point.x), float(point.y))
-                if not points or coordinate != points[-1]:
-                    points.append(coordinate)
+                _append_unique(points, _point_xy(segment.point(index / sample_count)))
         if len(points) >= 2:
             lines.append(LineString(points))
     return lines
@@ -1601,17 +1718,44 @@ def generate_toolpath(
     except Exception as exc:
         raise GenerationError(f"Unable to parse the uploaded SVG: {exc}") from exc
 
-    bbox = parsed_svg.bbox()
-    if bbox is None or len(bbox) != 4:
-        raise GenerationError("The SVG does not contain drawable geometry.")
-    if not all(math.isfinite(float(value)) for value in bbox):
-        raise GenerationError("The SVG has invalid or non-finite bounds.")
-
-    min_x, min_y, max_x, max_y = map(float, bbox)
-    svg_width = max_x - min_x
-    svg_height = max_y - min_y
     parsed_width = float(getattr(parsed_svg, "width", 0.0) or 0.0)
     parsed_height = float(getattr(parsed_svg, "height", 0.0) or 0.0)
+    viewbox = getattr(parsed_svg, "viewbox", None)
+    viewbox_values: tuple[float, float, float, float] | None = None
+    if viewbox is not None:
+        try:
+            viewbox_values = (
+                float(viewbox.x),
+                float(viewbox.y),
+                float(viewbox.width),
+                float(viewbox.height),
+            )
+        except (AttributeError, TypeError, ValueError):
+            viewbox_values = None
+
+    # Exact Bezier extrema require numerical root solving for every segment.
+    # Traced SVGs can contain tens of thousands of curves, making bbox() slower
+    # than the actual toolpath work. For outline tracing the viewport is the
+    # correct clipping/reference frame and is available without curve analysis.
+    if (
+        generation_mode == "outline"
+        and viewbox_values is not None
+        and all(math.isfinite(value) for value in viewbox_values)
+        and viewbox_values[2] > 0.0
+        and viewbox_values[3] > 0.0
+    ):
+        min_x, min_y = viewbox_values[0], viewbox_values[1]
+        svg_width, svg_height = viewbox_values[2], viewbox_values[3]
+        max_x, max_y = min_x + svg_width, min_y + svg_height
+    else:
+        bbox = parsed_svg.bbox()
+        if bbox is None or len(bbox) != 4:
+            raise GenerationError("The SVG does not contain drawable geometry.")
+        if not all(math.isfinite(float(value)) for value in bbox):
+            raise GenerationError("The SVG has invalid or non-finite bounds.")
+        min_x, min_y, max_x, max_y = map(float, bbox)
+        svg_width = max_x - min_x
+        svg_height = max_y - min_y
     if generation_mode == "outline":
         # Valid line art may be a single horizontal or vertical open stroke, whose
         # geometry bounds have zero height or width. Only reject a point-like SVG.
@@ -1698,7 +1842,7 @@ def generate_toolpath(
         stroke = getattr(element, "stroke", None)
 
         color = fill if fill is not None and fill != "none" else stroke
-        path_element = Path(element) if isinstance(element, Shape) else Path(element)
+        path_element = element if isinstance(element, Path) else Path(element)
 
         if generation_mode == "outline":
             target_step_mm = max(0.05, float(params.get("penThickness", 0.5)) * 0.35)
