@@ -1578,11 +1578,6 @@ document.addEventListener('keydown', event => {
         document.getElementById('generationStatus').textContent = 'Pattern-center selection cancelled.';
     }
 });
-renderLayerControls();
-updateArtworkWorkflowUi();
-updateMachiningEstimateUi();
-updateOutputFilenamePreview();
-
 document.getElementById('machineContinueBtn')?.addEventListener('click', () => {
     markMachineSetupConfigured();
     saveMachineSettings();
@@ -2689,4 +2684,11 @@ paper.view.onFrame = function() {
     }
 };
 
+// Run workflow initialization only after all output naming and G-code
+// constants have been initialized. Calling these earlier aborts app.js in the
+// temporal dead zone and prevents the SVG upload handlers from being installed.
+renderLayerControls();
+updateArtworkWorkflowUi();
+updateMachiningEstimateUi();
+updateOutputFilenamePreview();
 consumePendingConvertedSvg();
