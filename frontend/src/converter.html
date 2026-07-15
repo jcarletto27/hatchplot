@@ -158,6 +158,26 @@
         }
         canvas, #svgPreview svg { display: block; max-width: 100%; max-height: 70vh; width: auto; height: auto; }
         #svgPreview { color: #111; }
+        #svgPreview.wireframe svg *:not(title):not(metadata) {
+            fill: none !important;
+            stroke: #111 !important;
+            stroke-width: 1.25px !important;
+            vector-effect: non-scaling-stroke;
+        }
+        .engine-badge {
+            display: inline-flex;
+            margin-left: 7px;
+            padding: 3px 7px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--accent);
+            background: rgba(85, 214, 190, 0.08);
+            font-size: 0.66rem;
+            font-weight: 800;
+            letter-spacing: 0.03em;
+            text-transform: none;
+            vertical-align: middle;
+        }
         .metadata { margin-top: 12px; color: var(--muted); font-size: 0.76rem; }
         @media (max-width: 940px) {
             main { grid-template-columns: 1fr; }
@@ -196,8 +216,8 @@
             <label for="vectorEngine">Vectorization engine</label>
             <select id="vectorEngine" title="Choose the algorithm used to convert raster pixels into SVG geometry.">
                 <option value="linedraw" selected>Linedraw — contours and hatches</option>
-                <option value="potrace">Potrace — smooth monochrome regions</option>
-                <option value="pixels2svg">Pixels2SVG — pixel/color regions</option>
+                <option value="potrace" disabled>Potrace — smooth monochrome regions (checking…)</option>
+                <option value="pixels2svg" disabled>Pixels2SVG — pixel/color regions (checking…)</option>
             </select>
             <div id="vectorEngineHelp" class="helper"></div>
         </div>
@@ -366,6 +386,11 @@
             <label for="sortStrokes">Optimize stroke order to reduce pen-up travel</label>
         </div>
         <div class="checkbox-row">
+            <input id="wireframePreview" type="checkbox" checked>
+            <label for="wireframePreview">Preview vector geometry as wireframe</label>
+        </div>
+        <div class="helper">Wireframe preview affects only the on-screen comparison. Downloaded and transferred SVG data remains unchanged.</div>
+        <div class="checkbox-row">
             <input id="invertImage" type="checkbox">
             <label for="invertImage">Invert light and dark before tracing</label>
         </div>
@@ -398,13 +423,13 @@
                 <div class="stage"><canvas id="sourcePreview" width="1" height="1"></canvas></div>
             </div>
             <div class="preview-card">
-                <h3>Generated SVG</h3>
-                <div class="stage"><div id="svgPreview">Preview has not been generated.</div></div>
+                <h3>Generated SVG <span id="engineBadge" class="engine-badge">No result</span></h3>
+                <div class="stage"><div id="svgPreview" class="wireframe">Preview has not been generated.</div></div>
             </div>
         </div>
         <div id="metadata" class="metadata"></div>
     </section>
 </main>
-<script src="converter.js"></script>
+<script src="converter.js?v=engine-identity-1"></script>
 </body>
 </html>

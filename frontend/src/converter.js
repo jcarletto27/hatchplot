@@ -32,6 +32,8 @@ const previewButton = document.getElementById('previewBtn');
 const downloadButton = document.getElementById('downloadBtn');
 const sendButton = document.getElementById('sendBtn');
 const workspaceMode = document.getElementById('workspaceMode');
+const wireframePreview = document.getElementById('wireframePreview');
+const engineBadge = document.getElementById('engineBadge');
 
 function clamp(value, minimum, maximum) {
     return Math.max(minimum, Math.min(maximum, value));
@@ -58,6 +60,29 @@ function apiPath(path) {
     return `/api/${String(path).replace(/^\/+/, '')}`;
 }
 
+function normalizedEngineLabel(engine) {
+    return { linedraw: 'Linedraw', potrace: 'Potrace', pixels2svg: 'Pixels2SVG' }[engine] || engine;
+}
+
+function inspectSvgIdentity(svgText) {
+    const documentNode = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+    if (documentNode.querySelector('parsererror')) {
+        throw new Error('The selected engine returned malformed SVG data.');
+    }
+    const root = documentNode.documentElement;
+    if (!root || root.localName !== 'svg') {
+        throw new Error('The selected engine did not return an SVG document.');
+    }
+    return {
+        engine: root.getAttribute('data-hatchplot-engine') || '',
+        root
+    };
+}
+
+function applyPreviewStyle() {
+    svgPreview.classList.toggle('wireframe', Boolean(wireframePreview?.checked));
+}
+
 function setBusy(isBusy, message = '') {
     busy = isBusy;
     previewButton.disabled = isBusy || !sourceFile;
@@ -73,6 +98,7 @@ function invalidatePreview(message = 'Settings changed. Preview again before dow
     lastTraceStats = null;
     svgPreview.textContent = 'Preview is out of date.';
     metadataNode.textContent = '';
+    engineBadge.textContent = 'Preview required';
     statusNode.textContent = message;
     setBusy(false);
 }
@@ -95,15 +121,18 @@ function updateModeVisibility() {
 
 async function loadEngineAvailability() {
     try {
-        const response = await fetch(apiPath('vectorize/engines'), { headers: { Accept: 'application/json' } });
+        const response = await fetch(apiPath('vectorize/engines'), {
+            cache: 'no-store',
+            headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' }
+        });
         if (!response.ok) throw new Error(await readApiError(response));
         const payload = await response.json();
         const engines = payload?.engines || {};
         Array.from(vectorEngine.options).forEach(option => {
             const info = engines[option.value];
             if (!info) return;
-            option.disabled = info.available === false;
-            option.dataset.baseLabel = option.dataset.baseLabel || option.textContent.replace(/ \(not installed\)$/, '');
+            option.disabled = info.available !== true;
+            option.dataset.baseLabel = option.dataset.baseLabel || option.textContent.replace(/ \((?:not installed|checking…|checking\.\.\.)\)$/, '');
             option.textContent = info.available === false
                 ? `${option.dataset.baseLabel} (not installed)`
                 : option.dataset.baseLabel;
@@ -113,7 +142,12 @@ async function loadEngineAvailability() {
         updateModeVisibility();
     } catch (error) {
         console.warn('Unable to query optional converter engines:', error);
-        document.getElementById('vectorEngineHelp').textContent = 'Engine availability could not be checked. Linedraw remains available; optional engines may require the GPL Docker profile.';
+        Array.from(vectorEngine.options).forEach(option => {
+            if (option.value !== 'linedraw') option.disabled = true;
+        });
+        vectorEngine.value = 'linedraw';
+        updateModeVisibility();
+        document.getElementById('vectorEngineHelp').textContent = 'Engine availability could not be checked. Optional engines are disabled until the GPL backend can be verified.';
     }
 }
 
@@ -219,46 +253,78 @@ async function previewConversion() {
         alert('Choose an image first.');
         return;
     }
-    setBusy(true, `Generating SVG with ${vectorEngine.selectedOptions[0]?.textContent || vectorEngine.value}...`);
+
+    const settings = readSettings();
+    const requestedEngine = settings.engine;
+    const selectedOption = vectorEngine.selectedOptions[0];
+    if (!selectedOption || selectedOption.disabled) {
+        statusNode.textContent = `${normalizedEngineLabel(requestedEngine)} is not available in the active backend container.`;
+        return;
+    }
+
+    generatedSvg = '';
+    transferId = '';
+    lastTraceStats = null;
+    svgPreview.textContent = `Generating ${normalizedEngineLabel(requestedEngine)} output…`;
+    metadataNode.textContent = '';
+    engineBadge.textContent = `${normalizedEngineLabel(requestedEngine)} · running`;
+    setBusy(true, `Generating SVG with ${normalizedEngineLabel(requestedEngine)}...`);
     try {
-        const settings = readSettings();
         const response = await fetch(apiPath('vectorize'), {
             method: 'POST',
             body: buildVectorizeFormData(settings),
-            headers: { Accept: 'application/json' }
+            cache: 'no-store',
+            headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' }
         });
         if (!response.ok) throw new Error(await readApiError(response));
         const result = await response.json();
-        if (!result?.svg || !result?.stats || !result?.transfer_id) {
+        if (!result?.svg || !result?.stats || !result?.transfer_id || !result?.engine) {
             throw new Error('The vectorization service returned an incomplete result.');
         }
 
+        const svgIdentity = inspectSvgIdentity(result.svg);
+        const actualEngine = String(result.engine || result.stats.engine || '').toLowerCase();
+        if (actualEngine !== requestedEngine || String(result.stats.engine || '').toLowerCase() !== requestedEngine) {
+            throw new Error(`Engine mismatch: requested ${requestedEngine}, but the backend returned ${actualEngine || 'unknown'}. Rebuild both containers.`);
+        }
+        if (svgIdentity.engine.toLowerCase() !== requestedEngine) {
+            throw new Error(`SVG identity mismatch: requested ${requestedEngine}, but the SVG was stamped ${svgIdentity.engine || 'unknown'}.`);
+        }
+
         generatedSvg = result.svg;
-        generatedFilename = result.filename || `${safeBaseName(sourceFilename)}-${settings.engine}.svg`;
+        generatedFilename = result.filename || `${safeBaseName(sourceFilename)}-${requestedEngine}.svg`;
         transferId = result.transfer_id;
         lastTraceStats = result.stats;
         svgPreview.innerHTML = generatedSvg;
+        applyPreviewStyle();
+
         const stats = result.stats;
+        const digest = String(result.svg_sha256 || stats.svg_sha256 || '').slice(0, 12);
+        engineBadge.textContent = `${normalizedEngineLabel(actualEngine)}${digest ? ` · ${digest}` : ''}`;
         metadataNode.textContent = [
+            `Engine: ${normalizedEngineLabel(actualEngine)}`,
+            `File: ${generatedFilename}`,
+            digest ? `SVG ID: ${digest}` : '',
             `${Number(stats.trace_width).toLocaleString()} × ${Number(stats.trace_height).toLocaleString()} trace raster`,
             `${Number(stats.path_count || 0).toLocaleString()} vector paths/regions`,
             `${Number(stats.contour_paths || 0).toLocaleString()} contour paths`,
             `${Number(stats.hatch_paths || 0).toLocaleString()} hatch paths`,
             `${Number(stats.point_count || 0).toLocaleString()} points/segments`,
             `${Number(stats.output_width_mm).toFixed(1)} × ${Number(stats.output_height_mm).toFixed(1)} mm`,
-            stats.engine_detail || stats.engine || settings.engine
+            stats.engine_detail || actualEngine
         ].filter(Boolean).join(' · ');
-        statusNode.textContent = settings.engine === 'linedraw'
-            ? 'SVG preview ready. Linedraw output contains plotter-oriented contour and hatch polylines.'
-            : settings.engine === 'potrace'
-                ? 'SVG preview ready. Potrace produced smooth closed monochrome regions; Outline Trace will follow their boundaries.'
-                : 'SVG preview ready. Pixels2SVG produced quantized color-region polygons; Outline Trace will follow their boundaries.';
+        statusNode.textContent = actualEngine === 'linedraw'
+            ? 'Linedraw preview ready. Output contains plotter-oriented contour and hatch polylines.'
+            : actualEngine === 'potrace'
+                ? 'Potrace preview ready. Output contains smooth closed monochrome contour paths.'
+                : 'Pixels2SVG preview ready. Output contains quantized pixel/color-region polygons.';
     } catch (error) {
         generatedSvg = '';
         transferId = '';
         lastTraceStats = null;
         svgPreview.textContent = 'Conversion failed.';
         metadataNode.textContent = '';
+        engineBadge.textContent = 'Conversion failed';
         statusNode.textContent = `Conversion failed: ${error.message}`;
         console.error(error);
     } finally {
@@ -304,6 +370,7 @@ imageInput.addEventListener('change', async event => {
 vectorEngine.addEventListener('change', () => {
     updateModeVisibility();
     invalidatePreview('Vectorization engine changed. Preview again before downloading or sending the SVG.');
+    engineBadge.textContent = `${normalizedEngineLabel(vectorEngine.value)} · preview required`;
 });
 traceMode.addEventListener('change', () => {
     updateModeVisibility();
@@ -312,8 +379,9 @@ traceMode.addEventListener('change', () => {
 previewButton.addEventListener('click', previewConversion);
 downloadButton.addEventListener('click', downloadSvg);
 sendButton.addEventListener('click', sendToWorkspace);
+wireframePreview?.addEventListener('change', applyPreviewStyle);
 
-document.querySelectorAll('input:not(#imageInput), select:not(#traceMode):not(#vectorEngine):not(#workspaceMode)').forEach(control => {
+document.querySelectorAll('input:not(#imageInput):not(#wireframePreview), select:not(#traceMode):not(#vectorEngine):not(#workspaceMode)').forEach(control => {
     control.addEventListener('change', () => invalidatePreview());
 });
 
@@ -331,5 +399,7 @@ document.querySelectorAll('input[type="number"]').forEach(input => {
 });
 
 updateModeVisibility();
+applyPreviewStyle();
+engineBadge.textContent = `${normalizedEngineLabel(vectorEngine.value)} · preview required`;
 loadEngineAvailability();
 setBusy(false);

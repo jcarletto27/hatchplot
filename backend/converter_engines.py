@@ -242,7 +242,7 @@ def convert_potrace(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{output_width:.4f}mm" height="{output_height:.4f}mm" viewBox="0 0 {width} {height}">',
         f'<title>{escape(filename or "converted-image")}</title>',
         f'<metadata>{escape(metadata)}</metadata>',
-        f'<path id="potrace-regions" fill="#000000" stroke="none" fill-rule="evenodd" d="{"".join(path_parts)}"/>',
+        f'<path id="potrace-contours" fill="none" stroke="#000000" stroke-width="1" vector-effect="non-scaling-stroke" d="{"".join(path_parts)}"/>',
         '</svg>',
     ])
     return ConverterEngineResult(

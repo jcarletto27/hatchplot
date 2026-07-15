@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -2555,21 +2556,44 @@ def vectorize_raster_image(content: bytes, filename: str, settings: dict[str, An
         }
         svg = result.svg
 
+    # Stamp the actual backend engine into the SVG itself. The frontend verifies
+    # this marker before displaying or transferring a result, preventing stale
+    # responses or mismatched frontend/backend builds from masquerading as the
+    # selected engine.
+    engine_marker = f'data-hatchplot-engine="{engine}"'
+    if engine_marker not in svg:
+        svg = svg.replace("<svg ", f"<svg {engine_marker} ", 1)
+    svg_sha256 = hashlib.sha256(svg.encode("utf-8")).hexdigest()
+    stats["requested_engine"] = engine
+    stats["svg_sha256"] = svg_sha256
+
     safe_base = os.path.splitext(os.path.basename(filename or "converted-image"))[0]
     safe_base = "".join(character if character.isalnum() or character in "-_." else "-" for character in safe_base).strip("-.")
     output_filename = f"{safe_base or 'converted-image'}-{engine_suffix}.svg"
     transfer_id = _store_converter_transfer(svg, output_filename, stats)
+    logger.info(
+        "Vectorized %s with engine=%s paths=%s digest=%s",
+        filename,
+        engine,
+        stats.get("path_count", 0),
+        svg_sha256[:12],
+    )
     return {
         "svg": svg,
         "filename": output_filename,
         "transfer_id": transfer_id,
+        "engine": engine,
+        "svg_sha256": svg_sha256,
         "stats": stats,
     }
 
 
 @app.get("/vectorize/engines")
-def vectorize_engines() -> dict[str, Any]:
-    return {"engines": converter_engine_status()}
+def vectorize_engines() -> JSONResponse:
+    return JSONResponse(
+        content={"engines": converter_engine_status()},
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @app.post("/vectorize")
