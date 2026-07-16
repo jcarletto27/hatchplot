@@ -1876,8 +1876,8 @@ def _gcode_preamble(
         "End HatchPlot header",
     ])
 
-    lines = _custom_gcode_lines(params.get("startGcode", ""))
-    lines.extend(line for comment in comments for line in _gcode_comment_lines(comment))
+    lines = [line for comment in comments for line in _gcode_comment_lines(comment)]
+    lines.extend(_custom_gcode_lines(params.get("startGcode", "")))
     lines.extend([
         "G21",
         "G90",

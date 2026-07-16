@@ -609,13 +609,13 @@
                 </div>
                 <div class="form-group">
                     <label for="startGcode">Start G-code</label>
-                    <textarea id="startGcode" name="startGcode" class="machine-gcode" rows="4" spellcheck="false" placeholder="Optional commands inserted before the HatchPlot header"></textarea>
+                    <textarea id="startGcode" name="startGcode" class="machine-gcode" rows="4" spellcheck="false" placeholder="Optional commands inserted after the HatchPlot header"></textarea>
                 </div>
                 <div class="form-group">
                     <label for="endGcode">End G-code</label>
                     <textarea id="endGcode" name="endGcode" class="machine-gcode" rows="4" spellcheck="false" placeholder="Optional commands inserted after the final home move"></textarea>
                 </div>
-                <div class="helper-card">Custom commands are emitted verbatim, one command per line. Start commands run before HatchPlot's setup commands; end commands run after the final move to machine zero.</div>
+                <div class="helper-card">Custom commands are emitted verbatim, one command per line. Start commands run after the HatchPlot header and before its setup commands; end commands run after the final move to machine zero.</div>
                 <div class="workflow-footer">
                     <div id="machineSettingsStatus" class="status">Changes are saved automatically.</div>
                     <button type="button" id="machineContinueBtn" class="secondary-btn">Continue</button>
@@ -648,6 +648,10 @@
                 <div class="checkbox-row">
                     <input type="checkbox" id="autoCenter" checked>
                     <label for="autoCenter">Keep the SVG centered when the workspace changes</label>
+                </div>
+                <div class="checkbox-row">
+                    <input type="checkbox" id="autoFitOnLoad" checked>
+                    <label for="autoFitOnLoad">Auto-fit SVG to workspace on load</label>
                 </div>
                 <button type="button" id="centerSvgBtn" class="secondary-btn">Center in Workspace</button>
                 <div class="form-group">

@@ -98,7 +98,7 @@ const GENERATION_FIELD_TOOLTIPS = {
     zDown: 'Pen-down value. In stepper mode this is the drawing Z height; in Servo/PWM mode it is the output value used to press or lower the pen.',
     xyFeedRate: 'Drawing and travel speed for XY moves in millimeters per minute. This changes execution speed, not hatch geometry.',
     zPlungeRate: 'Pen-lift and pen-lower speed in millimeters per minute when using stepper Z mode.',
-    startGcode: 'Optional machine-specific commands emitted before HatchPlot sets units, absolute positioning, and pen-up state.',
+    startGcode: 'Optional machine-specific commands emitted after the HatchPlot metadata header and before units, absolute positioning, and pen-up setup.',
     endGcode: 'Optional machine-specific commands emitted after HatchPlot lifts the pen and returns to machine zero.',
     svgScale: 'Uniformly scales the source artwork before brightness sampling. Larger values expose more source detail but may exceed the machine bounds.',
     svgRotate: 'Rotates the source artwork around its center before brightness sampling and toolpath generation.',
@@ -572,6 +572,9 @@ function restoreStoredSettings() {
         if (typeof uiSettings.autoCenter === 'boolean') {
             document.getElementById('autoCenter').checked = uiSettings.autoCenter;
         }
+        if (typeof uiSettings.autoFitOnLoad === 'boolean') {
+            document.getElementById('autoFitOnLoad').checked = uiSettings.autoFitOnLoad;
+        }
         if (typeof uiSettings.autoPreviewGeneration === 'boolean') {
             document.getElementById('autoPreviewGeneration').checked = uiSettings.autoPreviewGeneration;
         }
@@ -618,6 +621,7 @@ function saveUiSettings() {
     try {
         localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify({
             autoCenter: document.getElementById('autoCenter').checked,
+            autoFitOnLoad: document.getElementById('autoFitOnLoad').checked,
             autoPreviewGeneration: document.getElementById('autoPreviewGeneration').checked,
             hideSourceSvg: document.getElementById('hideSourceSvg').checked,
             showBrightnessCutoffPreview: document.getElementById('showBrightnessCutoffPreview').checked,
@@ -1334,10 +1338,11 @@ function calculateFitScalePercent() {
         rotation
     );
 
-    return Math.min(
+    const fitScale = Math.min(
         (bedX * FIT_MARGIN) / rotated.width,
         (bedY * FIT_MARGIN) / rotated.height
     ) * 100;
+    return Math.max(0.1, Math.min(1000, fitScale));
 }
 
 function getSvgSizeAtScale(scalePercent = 100) {
@@ -1390,6 +1395,20 @@ function offerAutoScaleToFit(reason = 'upload') {
             : `Auto-scale declined; the existing ${formatNumber(currentScale)}% scale was retained.`;
     }
     return true;
+}
+
+function fitSvgToWorkspace(announce = true) {
+    if (!originalSVG) return null;
+    const fitScale = calculateFitScalePercent();
+    document.getElementById('svgScale').value = formatNumber(fitScale, 3);
+    document.getElementById('autoCenter').checked = true;
+    setCenterInputs();
+    saveUiSettings();
+    applyTransforms();
+    if (announce) {
+        generationStatus.textContent = `SVG fit to ${formatNumber(fitScale)}% and centered in the workspace.`;
+    }
+    return fitScale;
 }
 
 window.addEventListener('resize', () => initWorkspace(false));
@@ -1462,6 +1481,8 @@ document.getElementById('autoCenter').addEventListener('change', event => {
     saveUiSettings();
     if (event.target.checked) centerSvgInWorkspace();
 });
+
+document.getElementById('autoFitOnLoad').addEventListener('change', saveUiSettings);
 
 document.getElementById('centerSvgBtn').addEventListener('click', () => {
     document.getElementById('autoCenter').checked = true;
@@ -1668,8 +1689,13 @@ async function loadSvgText(svgText, filename = 'uploaded.svg', sourceLabel = 'Up
         sourceSvgSizeMm = determineSvgPhysicalSize(originalSVGText, image);
         if (document.getElementById('autoCenter').checked) setCenterInputs();
         await reloadPreviewFromLayerSelection(true);
-        const prompted = offerAutoScaleToFit('upload');
-        if (!prompted) {
+        const autoFit = document.getElementById('autoFitOnLoad').checked;
+        const fitScale = autoFit ? fitSvgToWorkspace(false) : null;
+        const prompted = autoFit ? false : offerAutoScaleToFit('upload');
+        if (autoFit) {
+            generationStatus.textContent =
+                `${sourceLabel} ${currentSourceFilename} and fit it to ${formatNumber(fitScale)}% of the workspace.`;
+        } else if (!prompted) {
             generationStatus.textContent = `${sourceLabel} ${currentSourceFilename} at ${formatNumber(sourceSvgSizeMm.width)} × ${formatNumber(sourceSvgSizeMm.height)} mm.`;
         }
         updateArtworkWorkflowUi();
@@ -2308,8 +2334,8 @@ function buildGcodeHeader(settings, pathCount = null) {
         'End HatchPlot header'
     );
 
-    const lines = String(settings.startGcode || '').split(/\r?\n/).filter(line => line.trim().length > 0);
-    lines.push(...comments.flatMap(gcodeCommentLines));
+    const lines = comments.flatMap(gcodeCommentLines);
+    lines.push(...String(settings.startGcode || '').split(/\r?\n/).filter(line => line.trim().length > 0));
     lines.push(
         'G21',
         'G90',

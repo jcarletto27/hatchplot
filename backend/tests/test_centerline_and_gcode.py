@@ -92,7 +92,10 @@ class CustomGcodeTests(unittest.TestCase):
         paths = [[[10.0, 20.0], [30.0, 40.0]]]
         estimate = _estimate_machining_time(paths, self.params)
         lines = _compile_gcode(paths, self.params, estimate)
-        self.assertEqual(lines[:2], ["M17", "; fixture ready"])
+        self.assertEqual(lines[0], "; HatchPlot generated G-code")
+        header_end = lines.index("; End HatchPlot header")
+        self.assertEqual(lines[header_end + 1:header_end + 3], ["M17", "; fixture ready"])
+        self.assertEqual(lines[header_end + 3:header_end + 6], ["G21", "G90", "G0 Z5"])
         self.assertEqual(lines[-3:], ["G0 X0 Y0", "M5", "M18"])
         self.assertEqual(len(_gcode_preamble(self.params, 1, estimate)), lines.index("G0 X10.00 Y20.00"))
 
@@ -110,8 +113,10 @@ class CustomGcodeTests(unittest.TestCase):
         self.assertEqual(result["stats"]["outline_trace_method"], "centerline")
         self.assertEqual(result["stats"]["outline_trace_source"], "browser-rendered-raster")
         self.assertGreater(len(result["paths"]), 0)
-        self.assertEqual(result["gcode"].splitlines()[:2], ["M17", "; fixture ready"])
-        self.assertEqual(result["gcode"].splitlines()[-2:], ["M5", "M18"])
+        gcode_lines = result["gcode"].splitlines()
+        header_end = gcode_lines.index("; End HatchPlot header")
+        self.assertEqual(gcode_lines[header_end + 1:header_end + 3], ["M17", "; fixture ready"])
+        self.assertEqual(gcode_lines[-2:], ["M5", "M18"])
 
 
 def _png_bytes(pixels: np.ndarray) -> bytes:
