@@ -13,6 +13,8 @@ HatchPlot is a web application and Python backend to process grayscale and multi
 
 - Generates precise crosshatched toolpaths
 
+- Downloads generated G-code locally or sends it to a WebDAV, FTP, or explicit FTPS destination
+
 
 - Hardware acceleration support (CUDA)
 
@@ -88,6 +90,12 @@ Example for starting the GPU-accelerated container:
 docker compose -f compose.gpu.yml up -d   
 
 ```
+
+## Network G-code Delivery
+
+After generating a toolpath, expand **WebDAV / FTP delivery** below the G-code preview. HatchPlot can upload the current `.nc` file with WebDAV `PUT`, plain FTP, or explicit FTPS. Connection details are stored in the browser; passwords are used only for the current page session and are never saved.
+
+The backend container must be able to resolve and connect to the destination. Configure delivery with `NETWORK_DELIVERY_ENABLED`, `NETWORK_DELIVERY_TIMEOUT_SECONDS`, and `MAX_NETWORK_GCODE_BYTES` in `.env`.
 
 ## Licenses
 

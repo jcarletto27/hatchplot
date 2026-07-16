@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import ftplib
 import hashlib
 import io
 import json
 import logging
 import math
 import os
+import ssl
 import threading
 import textwrap
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from multiprocessing import Manager
 import traceback
 import uuid
@@ -25,6 +31,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, sta
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, Field
 from linedraw_engine import LineDrawSettings, convert_image
 from converter_engines import (
     CommonRasterSettings,
@@ -80,6 +87,9 @@ converter_transfers: dict[str, dict[str, Any]] = {}
 converter_transfers_lock = threading.Lock()
 CONVERTER_TRANSFER_TTL_SECONDS = max(60, int(os.getenv("CONVERTER_TRANSFER_TTL_SECONDS", "900")))
 MAX_CONVERTER_TRANSFERS = max(1, int(os.getenv("MAX_CONVERTER_TRANSFERS", "12")))
+NETWORK_DELIVERY_ENABLED = os.getenv("NETWORK_DELIVERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+NETWORK_DELIVERY_TIMEOUT_SECONDS = max(3, min(300, int(os.getenv("NETWORK_DELIVERY_TIMEOUT_SECONDS", "30"))))
+MAX_NETWORK_GCODE_BYTES = max(1024, int(os.getenv("MAX_NETWORK_GCODE_BYTES", str(10 * 1024 * 1024))))
 
 
 class GenerationError(ValueError):
@@ -88,6 +98,25 @@ class GenerationError(ValueError):
 
 class GenerationLimitError(GenerationError):
     """The requested toolpath is too large to generate safely."""
+
+
+class NetworkDeliveryError(ValueError):
+    """A safe, user-facing network delivery failure."""
+
+
+class GcodeDeliveryRequest(BaseModel):
+    protocol: str = Field(min_length=3, max_length=12)
+    filename: str = Field(min_length=1, max_length=255)
+    gcode: str = Field(min_length=1)
+    url: str = Field(default="", max_length=2048)
+    host: str = Field(default="", max_length=255)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    directory: str = Field(default="", max_length=1024)
+    username: str = Field(default="", max_length=512)
+    password: str = Field(default="", max_length=2048)
+    ftp_tls: bool = False
+    passive: bool = True
+    verify_tls: bool = True
 
 
 def _new_executor() -> ProcessPoolExecutor:
@@ -106,7 +135,7 @@ async def lifespan(app: FastAPI):
         app.state.progress_manager.shutdown()
 
 
-app = FastAPI(title="HatchPlot API", version="2.4.0", lifespan=lifespan)
+app = FastAPI(title="HatchPlot API", version="2.5.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -162,6 +191,148 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             "request_id": request_id,
         },
     )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep WebDAV credentials from being forwarded to another origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _network_gcode_bytes(gcode: str) -> bytes:
+    content = str(gcode).rstrip("\r\n") + "\n"
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_NETWORK_GCODE_BYTES:
+        raise NetworkDeliveryError(
+            f"The G-code file exceeds the {MAX_NETWORK_GCODE_BYTES // (1024 * 1024)} MB network delivery limit."
+        )
+    return encoded
+
+
+def _safe_delivery_filename(filename: str) -> str:
+    cleaned = str(filename).strip()
+    if (
+        not cleaned
+        or cleaned in {".", ".."}
+        or os.path.basename(cleaned) != cleaned
+        or "/" in cleaned
+        or "\\" in cleaned
+        or any(ord(character) < 32 for character in cleaned)
+    ):
+        raise NetworkDeliveryError("The remote filename must be a plain filename without directory components.")
+    return cleaned
+
+
+def _webdav_target_url(base_url: str, filename: str) -> str:
+    parsed = urllib.parse.urlsplit(str(base_url).strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise NetworkDeliveryError("Enter a complete WebDAV folder URL beginning with http:// or https://.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise NetworkDeliveryError("The WebDAV URL cannot contain credentials, a query string, or a fragment.")
+    folder_path = parsed.path.rstrip("/") + "/"
+    target_path = folder_path + urllib.parse.quote(filename, safe="")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, target_path, "", ""))
+
+
+def _deliver_webdav(payload: GcodeDeliveryRequest, content: bytes, filename: str) -> str:
+    target_url = _webdav_target_url(payload.url, filename)
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Length": str(len(content)),
+        "User-Agent": "HatchPlot/2.5",
+    }
+    if payload.username or payload.password:
+        credentials = f"{payload.username}:{payload.password}".encode("utf-8")
+        headers["Authorization"] = "Basic " + base64.b64encode(credentials).decode("ascii")
+
+    context = ssl.create_default_context() if payload.verify_tls else ssl._create_unverified_context()
+    opener = urllib.request.build_opener(
+        _NoRedirectHandler(),
+        urllib.request.HTTPSHandler(context=context),
+    )
+    request = urllib.request.Request(target_url, data=content, headers=headers, method="PUT")
+    try:
+        with opener.open(request, timeout=NETWORK_DELIVERY_TIMEOUT_SECONDS) as response:
+            response_status = int(getattr(response, "status", response.getcode()))
+    except urllib.error.HTTPError as exc:
+        raise NetworkDeliveryError(f"The WebDAV server rejected the upload with HTTP {exc.code}.") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", None)
+        detail = str(reason or exc).strip()[:240]
+        raise NetworkDeliveryError(f"Unable to reach the WebDAV server: {detail}") from exc
+    if response_status not in {200, 201, 204}:
+        raise NetworkDeliveryError(f"The WebDAV server returned unexpected HTTP {response_status}.")
+    return target_url
+
+
+def _ftp_host(host: str) -> str:
+    cleaned = str(host).strip()
+    if not cleaned or any(character in cleaned for character in "/\\@") or any(character.isspace() for character in cleaned):
+        raise NetworkDeliveryError("Enter an FTP hostname or IP address without a URL scheme or path.")
+    return cleaned
+
+
+def _ftp_directory(directory: str) -> str:
+    cleaned = str(directory).strip()
+    if "\x00" in cleaned or any(part == ".." for part in cleaned.replace("\\", "/").split("/")):
+        raise NetworkDeliveryError("The FTP directory cannot contain parent-directory components.")
+    return cleaned
+
+
+def _deliver_ftp(payload: GcodeDeliveryRequest, content: bytes, filename: str) -> str:
+    host = _ftp_host(payload.host)
+    directory = _ftp_directory(payload.directory)
+    port = payload.port or 21
+    client: ftplib.FTP = (
+        ftplib.FTP_TLS(context=ssl.create_default_context())
+        if payload.ftp_tls
+        else ftplib.FTP()
+    )
+    try:
+        client.connect(host, port, timeout=NETWORK_DELIVERY_TIMEOUT_SECONDS)
+        client.login(payload.username or "anonymous", payload.password or "anonymous@")
+        if payload.ftp_tls:
+            client.prot_p()
+        client.set_pasv(payload.passive)
+        if directory:
+            client.cwd(directory)
+        client.storbinary(f"STOR {filename}", io.BytesIO(content))
+        try:
+            client.quit()
+        except ftplib.all_errors:
+            client.close()
+    except ftplib.all_errors as exc:
+        try:
+            client.close()
+        except OSError:
+            pass
+        detail = str(exc).strip()[:240] or "the FTP server rejected the connection"
+        raise NetworkDeliveryError(f"FTP upload failed: {detail}") from exc
+    scheme = "ftps" if payload.ftp_tls else "ftp"
+    remote_path = "/".join(part for part in [directory.strip("/"), urllib.parse.quote(filename, safe="")] if part)
+    return f"{scheme}://{host}:{port}/{remote_path}"
+
+
+def deliver_gcode_file(payload: GcodeDeliveryRequest) -> dict[str, Any]:
+    if not NETWORK_DELIVERY_ENABLED:
+        raise NetworkDeliveryError("Network G-code delivery is disabled by the server administrator.")
+    filename = _safe_delivery_filename(payload.filename)
+    content = _network_gcode_bytes(payload.gcode)
+    protocol = payload.protocol.strip().lower()
+    if protocol == "webdav":
+        destination = _deliver_webdav(payload, content, filename)
+    elif protocol == "ftp":
+        destination = _deliver_ftp(payload, content, filename)
+    else:
+        raise NetworkDeliveryError("Protocol must be webdav or ftp.")
+    return {
+        "status": "sent",
+        "protocol": "ftps" if protocol == "ftp" and payload.ftp_tls else protocol,
+        "filename": filename,
+        "bytes": len(content),
+        "destination": destination,
+    }
 
 
 def get_luminance(color: Color | None) -> float:
@@ -2827,8 +2998,25 @@ def health() -> dict[str, Any]:
         "job_workers": JOB_WORKERS,
         "acceleration_backend": ACCELERATION_BACKEND,
         "converter_engines": converter_engine_status(),
+        "network_delivery_enabled": NETWORK_DELIVERY_ENABLED,
         "pending_converter_transfers": len(converter_transfers),
     }
+
+
+@app.post("/gcode/deliver")
+def deliver_gcode(payload: GcodeDeliveryRequest) -> dict[str, Any]:
+    try:
+        result = deliver_gcode_file(payload)
+    except NetworkDeliveryError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    logger.info(
+        "Delivered G-code filename=%s protocol=%s bytes=%d destination=%s",
+        result["filename"],
+        result["protocol"],
+        result["bytes"],
+        result["destination"],
+    )
+    return result
 
 
 @app.post("/jobs", status_code=status.HTTP_202_ACCEPTED)

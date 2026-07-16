@@ -46,10 +46,12 @@ let canvasPanState = null;
 let accordionSyncing = false;
 let latestMachiningEstimate = null;
 let generatedOutputFilename = null;
+let networkDeliveryBusy = false;
 
 const MACHINE_SETTINGS_KEY = 'hatchPlotter.machineSettings.v1';
 const UI_SETTINGS_KEY = 'hatchPlotter.uiSettings.v1';
 const MACHINE_SETUP_COMPLETE_KEY = 'hatchPlotter.machineSetupConfigured.v1';
+const NETWORK_DELIVERY_SETTINGS_KEY = 'hatchPlotter.networkDelivery.v1';
 const SVG_TRANSFER_DB = 'hatchplot-artwork-transfer-v1';
 const SVG_TRANSFER_STORE = 'pending-artwork';
 const SVG_TRANSFER_KEY = 'pending';
@@ -1852,6 +1854,8 @@ const loadingDetails = document.getElementById('loadingDetails');
 const generationStatus = document.getElementById('generationStatus');
 const gcodeOutput = document.getElementById('gcodeOutput');
 const exportGcodeButton = document.getElementById('exportGcodeBtn');
+const openNetworkDeliveryButton = document.getElementById('openNetworkDeliveryBtn');
+const sendGcodeButton = document.getElementById('sendGcodeBtn');
 const gcodeLineCount = document.getElementById('gcodeLineCount');
 
 function sleep(milliseconds) {
@@ -1867,6 +1871,139 @@ async function readApiError(response) {
     }
     const text = await response.text().catch(() => '');
     return text || `Request failed with HTTP ${response.status}`;
+}
+
+function networkDeliveryField(id) {
+    return document.getElementById(id);
+}
+
+function updateNetworkProtocolVisibility() {
+    const isWebdav = networkDeliveryField('networkProtocol')?.value !== 'ftp';
+    ['webdavUrlGroup', 'webdavTlsGroup'].forEach(id => {
+        const element = networkDeliveryField(id);
+        if (element) element.hidden = !isWebdav;
+    });
+    ['ftpHostGroup', 'ftpPortGroup', 'ftpDirectoryGroup', 'ftpTlsGroup', 'ftpPassiveGroup'].forEach(id => {
+        const element = networkDeliveryField(id);
+        if (element) element.hidden = isWebdav;
+    });
+}
+
+function saveNetworkDeliverySettings() {
+    try {
+        localStorage.setItem(NETWORK_DELIVERY_SETTINGS_KEY, JSON.stringify({
+            protocol: networkDeliveryField('networkProtocol')?.value || 'webdav',
+            url: networkDeliveryField('webdavUrl')?.value.trim() || '',
+            host: networkDeliveryField('ftpHost')?.value.trim() || '',
+            port: networkDeliveryField('ftpPort')?.value || '21',
+            directory: networkDeliveryField('ftpDirectory')?.value.trim() || '',
+            username: networkDeliveryField('networkUsername')?.value || '',
+            ftpTls: Boolean(networkDeliveryField('ftpTls')?.checked),
+            passive: Boolean(networkDeliveryField('ftpPassive')?.checked),
+            verifyTls: Boolean(networkDeliveryField('webdavVerifyTls')?.checked)
+        }));
+    } catch (error) {
+        console.warn('Unable to save network delivery settings:', error);
+    }
+}
+
+function restoreNetworkDeliverySettings() {
+    try {
+        const settings = JSON.parse(localStorage.getItem(NETWORK_DELIVERY_SETTINGS_KEY) || '{}');
+        const values = {
+            networkProtocol: settings.protocol,
+            webdavUrl: settings.url,
+            ftpHost: settings.host,
+            ftpPort: settings.port,
+            ftpDirectory: settings.directory,
+            networkUsername: settings.username
+        };
+        Object.entries(values).forEach(([id, value]) => {
+            const element = networkDeliveryField(id);
+            if (element && value !== undefined && value !== null) element.value = value;
+        });
+        if (typeof settings.ftpTls === 'boolean') networkDeliveryField('ftpTls').checked = settings.ftpTls;
+        if (typeof settings.passive === 'boolean') networkDeliveryField('ftpPassive').checked = settings.passive;
+        if (typeof settings.verifyTls === 'boolean') networkDeliveryField('webdavVerifyTls').checked = settings.verifyTls;
+    } catch (error) {
+        console.warn('Unable to restore network delivery settings:', error);
+    }
+    updateNetworkProtocolVisibility();
+}
+
+function networkDeliveryPayload() {
+    const protocol = networkDeliveryField('networkProtocol').value;
+    const port = Number.parseInt(networkDeliveryField('ftpPort').value, 10);
+    return {
+        protocol,
+        filename: generatedOutputFilename || updateOutputFilenamePreview(),
+        gcode: gcodeOutput.value,
+        url: networkDeliveryField('webdavUrl').value.trim(),
+        host: networkDeliveryField('ftpHost').value.trim(),
+        port: Number.isInteger(port) ? port : null,
+        directory: networkDeliveryField('ftpDirectory').value.trim(),
+        username: networkDeliveryField('networkUsername').value,
+        password: networkDeliveryField('networkPassword').value,
+        ftp_tls: Boolean(networkDeliveryField('ftpTls').checked),
+        passive: Boolean(networkDeliveryField('ftpPassive').checked),
+        verify_tls: Boolean(networkDeliveryField('webdavVerifyTls').checked)
+    };
+}
+
+async function sendGcodeToNetwork() {
+    if (networkDeliveryBusy || activeJobId || gcodeLines.length === 0) return;
+    const payload = networkDeliveryPayload();
+    const statusNode = networkDeliveryField('networkDeliveryStatus');
+    if (payload.protocol === 'webdav' && !payload.url) {
+        statusNode.textContent = 'Enter a WebDAV folder URL.';
+        networkDeliveryField('webdavUrl').focus();
+        return;
+    }
+    if (payload.protocol === 'ftp' && !payload.host) {
+        statusNode.textContent = 'Enter an FTP host.';
+        networkDeliveryField('ftpHost').focus();
+        return;
+    }
+
+    networkDeliveryBusy = true;
+    saveNetworkDeliverySettings();
+    updateExportAvailability();
+    statusNode.textContent = `Sending ${payload.filename} via ${payload.protocol === 'ftp' && payload.ftp_tls ? 'FTPS' : payload.protocol.toUpperCase()}…`;
+    try {
+        const response = await fetch('/api/gcode/deliver', {
+            method: 'POST',
+            cache: 'no-store',
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error(await readApiError(response));
+        const result = await response.json();
+        statusNode.textContent = `Sent ${result.filename} (${Number(result.bytes).toLocaleString()} bytes) to ${result.destination}.`;
+    } catch (error) {
+        console.error('Network G-code delivery failed:', error);
+        statusNode.textContent = `Send failed: ${error.message}`;
+    } finally {
+        networkDeliveryBusy = false;
+        updateExportAvailability();
+    }
+}
+
+function bindNetworkDelivery() {
+    restoreNetworkDeliverySettings();
+    networkDeliveryField('networkProtocol')?.addEventListener('change', () => {
+        updateNetworkProtocolVisibility();
+        saveNetworkDeliverySettings();
+    });
+    ['webdavUrl', 'ftpHost', 'ftpPort', 'ftpDirectory', 'networkUsername', 'ftpTls', 'ftpPassive', 'webdavVerifyTls'].forEach(id => {
+        networkDeliveryField(id)?.addEventListener('change', saveNetworkDeliverySettings);
+    });
+    openNetworkDeliveryButton?.addEventListener('click', () => {
+        const panel = networkDeliveryField('networkDeliveryPanel');
+        if (panel) panel.open = true;
+        const focusId = networkDeliveryField('networkProtocol')?.value === 'ftp' ? 'ftpHost' : 'webdavUrl';
+        networkDeliveryField(focusId)?.focus();
+    });
+    sendGcodeButton?.addEventListener('click', sendGcodeToNetwork);
 }
 
 function formatDuration(seconds) {
@@ -1960,8 +2097,10 @@ function clearLoading() {
 }
 
 function updateExportAvailability() {
-    if (!exportGcodeButton) return;
-    exportGcodeButton.disabled = Boolean(activeJobId) || gcodeLines.length === 0;
+    const unavailable = Boolean(activeJobId) || gcodeLines.length === 0;
+    if (exportGcodeButton) exportGcodeButton.disabled = unavailable;
+    if (openNetworkDeliveryButton) openNetworkDeliveryButton.disabled = unavailable;
+    if (sendGcodeButton) sendGcodeButton.disabled = unavailable || networkDeliveryBusy;
 }
 
 function setGcodeLines(lines) {
@@ -2747,6 +2886,7 @@ function initializeHatchPlot() {
         updateMachiningEstimateUi();
         updateOutputFilenamePreview();
         bindWorkflowNavigation();
+        bindNetworkDelivery();
         consumePendingConvertedSvg();
         document.body.dataset.hatchPlotReady = 'true';
     } catch (error) {

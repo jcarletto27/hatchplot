@@ -442,6 +442,28 @@
             padding: 10px 12px 0;
         }
         .output-actions button { width: auto; min-height: 34px; margin: 0; padding: 6px 12px; }
+        .output-action-buttons { display: flex; align-items: center; gap: 8px; }
+        .network-delivery {
+            margin: 9px 10px 0;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: rgba(8, 13, 21, 0.42);
+        }
+        .output-panel .network-delivery > summary {
+            min-height: 38px;
+            padding: 8px 11px;
+            color: var(--muted);
+            font-size: 0.74rem;
+        }
+        .network-delivery[open] > summary { color: var(--text); border-bottom: 1px solid var(--border); }
+        .network-delivery-body { padding: 0 11px 11px; }
+        .network-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 10px; }
+        .network-grid .wide { grid-column: 1 / -1; }
+        .network-checkboxes { display: flex; gap: 10px; flex-wrap: wrap; }
+        .network-checkboxes .checkbox-row { flex: 1; min-width: 190px; }
+        .network-delivery-footer { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+        .network-delivery-footer button { width: auto; min-width: 130px; min-height: 36px; margin: 0; }
+        .network-delivery-footer .status { flex: 1; margin: 0; }
         textarea {
             display: block;
             width: calc(100% - 20px);
@@ -518,6 +540,10 @@
             .main-panel { min-height: 760px; height: 100vh; }
         }
         @media (max-width: 520px) {
+            .network-grid { grid-template-columns: 1fr; }
+            .network-grid .wide { grid-column: auto; }
+            .output-action-buttons { width: 100%; }
+            .output-action-buttons button { flex: 1; }
             .sidebar, .main-panel { padding: 12px; }
             .flex-row { flex-direction: column; gap: 0; }
             .canvas-toolbar input[type="range"] { width: 120px; }
@@ -837,8 +863,68 @@
                     <span id="outputFilenamePreview" class="output-filename">hatchplt-TL-HATCH-Linear.nc</span>
                     <span id="outputTimeEstimate">Estimated time: —</span>
                 </div>
-                <button type="button" id="exportGcodeBtn" class="secondary-btn" disabled>Export .nc</button>
+                <div class="output-action-buttons">
+                    <button type="button" id="exportGcodeBtn" class="secondary-btn" disabled>Export .nc</button>
+                    <button type="button" id="openNetworkDeliveryBtn" class="secondary-btn" disabled>Send to network</button>
+                </div>
             </div>
+            <details class="network-delivery" id="networkDeliveryPanel">
+                <summary>WebDAV / FTP delivery</summary>
+                <div class="network-delivery-body">
+                    <div class="network-grid">
+                        <div class="form-group">
+                            <label for="networkProtocol">Protocol</label>
+                            <select id="networkProtocol">
+                                <option value="webdav">WebDAV</option>
+                                <option value="ftp">FTP / FTPS</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="networkUsername">Username</label>
+                            <input id="networkUsername" type="text" autocomplete="username" placeholder="Optional">
+                        </div>
+                        <div class="form-group wide" id="webdavUrlGroup">
+                            <label for="webdavUrl">WebDAV folder URL</label>
+                            <input id="webdavUrl" type="url" inputmode="url" placeholder="https://nas.local/webdav/plotter/">
+                        </div>
+                        <div class="form-group" id="ftpHostGroup" hidden>
+                            <label for="ftpHost">FTP host</label>
+                            <input id="ftpHost" type="text" placeholder="plotter.local">
+                        </div>
+                        <div class="form-group" id="ftpPortGroup" hidden>
+                            <label for="ftpPort">FTP port</label>
+                            <input id="ftpPort" type="number" min="1" max="65535" value="21">
+                        </div>
+                        <div class="form-group wide" id="ftpDirectoryGroup" hidden>
+                            <label for="ftpDirectory">Remote directory</label>
+                            <input id="ftpDirectory" type="text" placeholder="/jobs">
+                        </div>
+                        <div class="form-group wide">
+                            <label for="networkPassword">Password</label>
+                            <input id="networkPassword" type="password" autocomplete="current-password" placeholder="Not saved in this browser">
+                        </div>
+                    </div>
+                    <div class="network-checkboxes">
+                        <div class="checkbox-row" id="webdavTlsGroup">
+                            <input id="webdavVerifyTls" type="checkbox" checked>
+                            <label for="webdavVerifyTls">Verify HTTPS certificate</label>
+                        </div>
+                        <div class="checkbox-row" id="ftpTlsGroup" hidden>
+                            <input id="ftpTls" type="checkbox">
+                            <label for="ftpTls">Use explicit FTPS (TLS)</label>
+                        </div>
+                        <div class="checkbox-row" id="ftpPassiveGroup" hidden>
+                            <input id="ftpPassive" type="checkbox" checked>
+                            <label for="ftpPassive">Use passive FTP</label>
+                        </div>
+                    </div>
+                    <div class="helper-card">Connection details are saved only in this browser. Passwords are never saved. The backend container must be able to reach the destination.</div>
+                    <div class="network-delivery-footer">
+                        <button type="button" id="sendGcodeBtn" disabled>Send file</button>
+                        <div id="networkDeliveryStatus" class="status" aria-live="polite">Generate G-code before sending.</div>
+                    </div>
+                </div>
+            </details>
             <textarea id="gcodeOutput" readonly spellcheck="false" placeholder="Generated G-code appears here. The currently executing line is highlighted during simulation."></textarea>
         </details>
     </main>
