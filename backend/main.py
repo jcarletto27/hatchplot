@@ -236,7 +236,9 @@ def _deliver_webdav(payload: GcodeDeliveryRequest, content: bytes, filename: str
     parsed = urllib.parse.urlsplit(target_url)
     request_path = urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, ""))
     headers = [
-        ("Content-Type", "text/plain; charset=utf-8"),
+        # Treat G-code as an opaque file. Some embedded WebDAV servers parse
+        # text PUT bodies like form data and discard content containing `=`.
+        ("Content-Type", "application/octet-stream"),
         # Preserve this exact spelling. Some embedded WebDAV/SD-card servers
         # incorrectly treat HTTP header names as case-sensitive and interpret
         # urllib's normalized `Content-length` spelling as a zero-byte PUT.

@@ -63,6 +63,10 @@ class NetworkDeliveryClientTests(unittest.TestCase):
             (("Content-Length", str(len(b"G0 X0 Y0\n"))), {}),
             [(call.args, call.kwargs) for call in connection.putheader.call_args_list],
         )
+        self.assertIn(
+            (("Content-Type", "application/octet-stream"), {}),
+            [(call.args, call.kwargs) for call in connection.putheader.call_args_list],
+        )
         authorization_calls = [
             call.args[1]
             for call in connection.putheader.call_args_list
