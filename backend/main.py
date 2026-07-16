@@ -446,6 +446,8 @@ def validate_generation_params(params: dict[str, Any]) -> None:
     generation_mode = str(params.get("generationMode", "hatch"))
     if generation_mode not in {"hatch", "outline", "outline-hatch"}:
         raise GenerationError("generationMode must be hatch, outline, or outline-hatch.")
+    if params.get("outlineTraceMethod", "boundary") not in {"boundary", "centerline"}:
+        raise GenerationError("outlineTraceMethod must be boundary or centerline.")
     if params.get("workspaceOrigin", "top-left") not in {"top-left", "top-right", "bottom-left", "bottom-right"}:
         raise GenerationError("workspaceOrigin must be top-left, top-right, bottom-left, or bottom-right.")
 
@@ -501,6 +503,13 @@ def validate_generation_params(params: dict[str, Any]) -> None:
             raise GenerationError(f"{key} must be numeric.") from exc
         if not math.isfinite(value):
             raise GenerationError(f"{key} must be a finite number.")
+
+    for key in ("startGcode", "endGcode"):
+        value = str(params.get(key, ""))
+        if "\x00" in value:
+            raise GenerationError(f"{key} cannot contain null characters.")
+        if len(value.encode("utf-8")) > 65_536:
+            raise GenerationError(f"{key} cannot exceed 64 KiB.")
 
 
 def _set_progress(
@@ -1007,7 +1016,7 @@ def _generate_outline_paths_from_raster(
     ):
         interior &= padded[1 + row_offset:1 + row_offset + mask.shape[0], 1 + column_offset:1 + column_offset + mask.shape[1]]
     interior_fraction = float(np.count_nonzero(interior)) / ink_pixels
-    trace_method = "centerline" if interior_fraction < 0.82 else "boundary"
+    trace_method = str(params.get("outlineTraceMethod", "centerline"))
     pixel_mm = max(bed_x / max(1, image.width), bed_y / max(1, image.height))
     simplify_tolerance = max(pixel_mm * 0.65, pen_thickness * 0.06, 0.015)
     minimum_length = max(pixel_mm * 2.0, pen_thickness * 0.75, 0.08)
@@ -1650,10 +1659,11 @@ def _gcode_preamble(
         f"SVG transform: scale={float(params['svgScale']):.3f}% ({_gcode_comment_value(params.get('svgScaleMode', 'fit-relative'))}); rotation={float(params['svgRotate']):.3f} deg; center=({display_svg_x:.3f}, {display_svg_y:.3f}) mm",
     ]
     if generation_mode in {"outline", "outline-hatch"}:
+        outline_method = str(params.get("outlineTraceMethod", "boundary"))
         comments.append(
-            "Outline: traces native SVG vector geometry; stroked paths "
-            "follow their centerlines and filled shapes follow their "
-            "vector boundaries"
+            "Outline: scan-engine centerline extraction from visible artwork"
+            if outline_method == "centerline"
+            else "Outline: native SVG strokes and filled-shape vector boundaries"
         )
     if generation_mode in {"hatch", "outline-hatch"}:
         comments.extend([
@@ -1663,7 +1673,7 @@ def _gcode_preamble(
         ])
     if generation_mode == "outline-hatch":
         comments.append(
-            "Sequence: native SVG outlines are plotted first, followed "
+            "Sequence: selected outline traces are plotted first, followed "
             "by brightness-driven hatch paths"
         )
     if machining_estimate:
@@ -1683,13 +1693,19 @@ def _gcode_preamble(
         "End HatchPlot header",
     ])
 
-    lines = [line for comment in comments for line in _gcode_comment_lines(comment)]
+    lines = _custom_gcode_lines(params.get("startGcode", ""))
+    lines.extend(line for comment in comments for line in _gcode_comment_lines(comment))
     lines.extend([
         "G21",
         "G90",
         f"G0 Z{params['zUp']}" if params["zMode"] == "stepper" else f"M3 S{params['zUp']}",
     ])
     return lines
+
+
+def _custom_gcode_lines(value: Any) -> list[str]:
+    """Normalize saved multi-line machine commands without changing their content."""
+    return [line.rstrip("\r") for line in str(value or "").splitlines() if line.strip()]
 
 
 def _compile_gcode(
@@ -1716,6 +1732,7 @@ def _compile_gcode(
             gcode.append(f"G1 X{output_x:.2f} Y{output_y:.2f}{feed}")
         gcode.append(f"G0 Z{z_up}" if z_mode == "stepper" else f"M3 S{z_up}")
     gcode.append("G0 X0 Y0")
+    gcode.extend(_custom_gcode_lines(params.get("endGcode", "")))
     return gcode
 
 def generate_toolpath(
@@ -1731,6 +1748,52 @@ def generate_toolpath(
     validate_generation_params(params)
 
     generation_mode = str(params.get("generationMode", "hatch"))
+    if generation_mode == "outline" and params.get("outlineTraceMethod", "boundary") == "centerline":
+        if brightness_map is None:
+            raise GenerationError("Centerline outline tracing requires the browser-rendered artwork map.")
+        compiled_paths, outline_stats = _generate_outline_paths_from_raster(
+            brightness_map, params, progress, preview_queue
+        )
+        _set_progress(
+            progress,
+            phase="gcode",
+            percent=94.0,
+            completed=0,
+            total=len(compiled_paths),
+            detail="Compiling centerline traces into G-code...",
+            compute_backend="numpy-cpu",
+        )
+        machining_estimate = _estimate_machining_time(compiled_paths, params)
+        gcode = _compile_gcode(compiled_paths, params, machining_estimate)
+        duration = time.perf_counter() - started
+        stats = {
+            **machining_estimate,
+            **outline_stats,
+            "output_filename": _suggest_output_filename(params),
+            "duration_seconds": round(duration, 3),
+            "drawable_elements": None,
+            "outline_paths": len(compiled_paths),
+            "hatch_paths": 0,
+            "continuous_paths": len(compiled_paths),
+            "generation_mode": "outline",
+            "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
+            "toolpath_points": sum(len(path) for path in compiled_paths),
+            "gcode_lines": len(gcode),
+            "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths), machining_estimate)),
+            "pen_thickness_mm": float(params.get("penThickness", 0.5)),
+        }
+        _set_progress(
+            progress,
+            phase="completed",
+            percent=100.0,
+            completed=len(compiled_paths),
+            total=len(compiled_paths),
+            detail="Centerline trace generation completed.",
+            compute_backend="numpy-cpu",
+            force_eta_zero=True,
+        )
+        return {"gcode": "\n".join(gcode), "paths": compiled_paths, "stats": stats}
+
     if generation_mode == "outline-hatch":
         if brightness_map is None:
             raise GenerationError("Outline then Hatch requires the browser-rendered brightness map.")
@@ -1745,7 +1808,13 @@ def generate_toolpath(
         _check_cancel_requested(progress)
         outline_params = dict(params)
         outline_params["generationMode"] = "outline"
-        outline_result = generate_toolpath(svg_content, outline_params, None, None, None)
+        outline_result = generate_toolpath(
+            svg_content,
+            outline_params,
+            brightness_map if outline_params.get("outlineTraceMethod") == "centerline" else None,
+            None,
+            None,
+        )
         outline_paths = list(outline_result.get("paths") or [])
         outline_stats = dict(outline_result.get("stats") or {})
         _check_cancel_requested(progress)
@@ -2127,7 +2196,7 @@ def generate_toolpath(
         stats.update({
             "outline_sampling_mm": max(0.05, float(params.get("penThickness", 0.5)) * 0.35),
             "outline_trace_source": "svg-vector-geometry",
-            "outline_trace_method": "vector-boundary",
+            "outline_trace_method": str(params.get("outlineTraceMethod", "boundary")),
         })
 
     result = {
@@ -2305,6 +2374,7 @@ def _params_from_form(
     densityFudge: float,
     brightnessCutoff: float,
     generationMode: str,
+    outlineTraceMethod: str,
     workspaceOrigin: str,
     patternLayout: str,
     waveform: str,
@@ -2316,6 +2386,8 @@ def _params_from_form(
     waveAmplitude: float,
     waveLength: float,
     brightnessModulation: str,
+    startGcode: str,
+    endGcode: str,
 ) -> dict[str, Any]:
     return {
         "bedX": bedX,
@@ -2336,6 +2408,7 @@ def _params_from_form(
         "densityFudge": densityFudge,
         "brightnessCutoff": brightnessCutoff,
         "generationMode": generationMode,
+        "outlineTraceMethod": outlineTraceMethod,
         "workspaceOrigin": workspaceOrigin,
         "patternLayout": patternLayout,
         "waveform": waveform,
@@ -2347,6 +2420,8 @@ def _params_from_form(
         "waveAmplitude": waveAmplitude,
         "waveLength": waveLength,
         "brightnessModulation": brightnessModulation,
+        "startGcode": startGcode,
+        "endGcode": endGcode,
     }
 
 
@@ -2779,6 +2854,7 @@ async def create_generation_job(
     densityFudge: float = Form(0.0),
     brightnessCutoff: float = Form(DEFAULT_BRIGHTNESS_CUTOFF),
     generationMode: str = Form("hatch"),
+    outlineTraceMethod: str = Form("boundary"),
     workspaceOrigin: str = Form("top-left"),
     patternLayout: str = Form("linear"),
     waveform: str = Form("zigzag"),
@@ -2790,6 +2866,8 @@ async def create_generation_job(
     waveAmplitude: float = Form(0.5),
     waveLength: float = Form(3.0),
     brightnessModulation: str = Form("both"),
+    startGcode: str = Form(""),
+    endGcode: str = Form(""),
     enabledLayers: str = Form("[]"),
 ):
     _cleanup_jobs()
@@ -2817,6 +2895,7 @@ async def create_generation_job(
         densityFudge,
         brightnessCutoff,
         generationMode,
+        outlineTraceMethod,
         workspaceOrigin,
         patternLayout,
         waveform,
@@ -2828,6 +2907,8 @@ async def create_generation_job(
         waveAmplitude,
         waveLength,
         brightnessModulation,
+        startGcode,
+        endGcode,
     )
     params["sourceFilename"] = file.filename or "uploaded.svg"
     try:
@@ -2984,6 +3065,7 @@ async def generate_gcode_compatibility(
     densityFudge: float = Form(0.0),
     brightnessCutoff: float = Form(DEFAULT_BRIGHTNESS_CUTOFF),
     generationMode: str = Form("hatch"),
+    outlineTraceMethod: str = Form("boundary"),
     workspaceOrigin: str = Form("top-left"),
     patternLayout: str = Form("linear"),
     waveform: str = Form("zigzag"),
@@ -2995,6 +3077,8 @@ async def generate_gcode_compatibility(
     waveAmplitude: float = Form(0.5),
     waveLength: float = Form(3.0),
     brightnessModulation: str = Form("both"),
+    startGcode: str = Form(""),
+    endGcode: str = Form(""),
     enabledLayers: str = Form("[]"),
 ):
     """Backward-compatible synchronous endpoint for existing API clients."""
@@ -3019,6 +3103,7 @@ async def generate_gcode_compatibility(
         densityFudge,
         brightnessCutoff,
         generationMode,
+        outlineTraceMethod,
         workspaceOrigin,
         patternLayout,
         waveform,
@@ -3030,6 +3115,8 @@ async def generate_gcode_compatibility(
         waveAmplitude,
         waveLength,
         brightnessModulation,
+        startGcode,
+        endGcode,
     )
     params["sourceFilename"] = file.filename or "uploaded.svg"
     try:

@@ -9,8 +9,10 @@ const ENGINE_HELP = {
 
 const TRACE_MODE_HELP = {
     contour: 'Detects image edges and converts them into open plotter polylines. This is the closest equivalent to linedraw contour-only mode.',
+    centerline: 'Uses the foreground threshold, thins visible marks to one-pixel skeletons, and emits single-stroke centerline polylines instead of both shape boundaries.',
     hatch: 'Builds tone-dependent hatch strokes directly from image brightness. Dark cells receive additional strokes; light cells receive few or none.',
-    'contour-hatch': 'Combines contour polylines with brightness-driven hatch strokes, then orders each pass to reduce pen-up travel.'
+    'contour-hatch': 'Combines contour polylines with brightness-driven hatch strokes, then orders each pass to reduce pen-up travel.',
+    'centerline-hatch': 'Combines skeletonized centerlines with brightness-driven hatch strokes, then orders each pass to reduce pen-up travel.'
 };
 
 let sourceImage = null;
@@ -110,7 +112,7 @@ function updateModeVisibility() {
     const isLinedraw = engine === 'linedraw';
     document.getElementById('linedrawModeGroup').hidden = !isLinedraw;
     document.getElementById('contourOptions').hidden = !isLinedraw || mode === 'hatch';
-    document.getElementById('hatchOptions').hidden = !isLinedraw || mode === 'contour';
+    document.getElementById('hatchOptions').hidden = !isLinedraw || !['hatch', 'contour-hatch', 'centerline-hatch'].includes(mode);
     document.getElementById('sortStrokesRow').hidden = !isLinedraw;
     document.getElementById('inkscapeOptions').hidden = engine !== 'inkscape';
     document.getElementById('potraceOptions').hidden = engine !== 'potrace';
@@ -323,7 +325,7 @@ async function previewConversion() {
             stats.engine_detail || actualEngine
         ].filter(Boolean).join(' · ');
         statusNode.textContent = actualEngine === 'linedraw'
-            ? 'Linedraw preview ready. Output contains plotter-oriented contour and hatch polylines.'
+            ? `${TRACE_MODE_HELP[traceMode.value] || 'Linedraw vectorization complete'} Preview ready.`
             : actualEngine === 'inkscape'
                 ? 'Inkscape preview ready. Output was produced by Inkscape color multi-scan Trace Bitmap.'
                 : actualEngine === 'potrace'

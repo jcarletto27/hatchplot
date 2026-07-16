@@ -461,6 +461,13 @@
         }
         textarea:focus { border-color: rgba(96, 211, 148, 0.52); }
         textarea::selection { color: #08100b; background: #ffd166; }
+        textarea.machine-gcode {
+            width: 100%;
+            height: 82px;
+            margin: 0;
+            padding: 9px 10px;
+            box-sizing: border-box;
+        }
 
         #loading {
             display: none;
@@ -574,6 +581,15 @@
                     <div class="form-group"><label for="xyFeedRate">XY feed (mm/min)</label><input type="number" id="xyFeedRate" name="xyFeedRate" value="2000"></div>
                     <div class="form-group"><label for="zPlungeRate">Z plunge (mm/min)</label><input type="number" id="zPlungeRate" name="zPlungeRate" value="300"></div>
                 </div>
+                <div class="form-group">
+                    <label for="startGcode">Start G-code</label>
+                    <textarea id="startGcode" name="startGcode" class="machine-gcode" rows="4" spellcheck="false" placeholder="Optional commands inserted before the HatchPlot header"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="endGcode">End G-code</label>
+                    <textarea id="endGcode" name="endGcode" class="machine-gcode" rows="4" spellcheck="false" placeholder="Optional commands inserted after the final home move"></textarea>
+                </div>
+                <div class="helper-card">Custom commands are emitted verbatim, one command per line. Start commands run before HatchPlot's setup commands; end commands run after the final move to machine zero.</div>
                 <div class="workflow-footer">
                     <div id="machineSettingsStatus" class="status">Changes are saved automatically.</div>
                     <button type="button" id="machineContinueBtn" class="secondary-btn">Continue</button>
@@ -641,8 +657,15 @@
                         <option value="outline-hatch">Outline then Hatch</option>
                     </select>
                 </div>
-                <div id="outlineModeHelp" class="helper-card" hidden>Outline Trace uses the SVG's native vector geometry. Stroked paths follow their centerlines, while filled shapes follow their vector boundaries. The SVG is not rasterized, and brightness, layout, and waveform controls are not used in this mode.</div>
-                <div id="outlineHatchModeHelp" class="helper-card" hidden>Outline then Hatch plots the native SVG outlines first, then adds the selected brightness-driven hatch pattern. Both vector outline and hatch settings are included in the exported G-code header.</div>
+                <div class="form-group" id="outlineTraceMethodGroup" hidden>
+                    <label for="outlineTraceMethod">Outline trace method</label>
+                    <select id="outlineTraceMethod" name="outlineTraceMethod">
+                        <option value="boundary">Shape boundaries</option>
+                        <option value="centerline">Centerlines (scan engine)</option>
+                    </select>
+                </div>
+                <div id="outlineModeHelp" class="helper-card" hidden>Outline Trace can follow native SVG boundaries or scan the rendered artwork into single-stroke centerlines. Brightness, layout, and waveform controls are not used in this mode.</div>
+                <div id="outlineHatchModeHelp" class="helper-card" hidden>Outline then Hatch plots the selected boundary or centerline trace first, then adds the brightness-driven hatch pattern. Both passes are included in the exported G-code header.</div>
                 <div class="form-group">
                     <label for="penThickness">Pen size / tip thickness (mm)</label>
                     <input type="number" id="penThickness" name="penThickness" min="0.05" max="10" step="0.05" placeholder="e.g. 0.5">

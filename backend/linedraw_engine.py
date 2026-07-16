@@ -231,6 +231,55 @@ def trace_contours(gray: np.ndarray, settings: LineDrawSettings) -> list[Polylin
     return result
 
 
+def _thin_binary_linework(mask: np.ndarray, maximum_iterations: int = 96) -> np.ndarray:
+    """Reduce foreground regions to one-pixel Zhang-Suen skeletons."""
+    image = mask.astype(bool, copy=True)
+    if image.shape[0] < 3 or image.shape[1] < 3:
+        return image
+    for _ in range(maximum_iterations):
+        changed = False
+        for first_pass in (True, False):
+            padded = np.pad(image, 1, mode="constant", constant_values=False)
+            p2, p3, p4 = padded[:-2, 1:-1], padded[:-2, 2:], padded[1:-1, 2:]
+            p5, p6, p7 = padded[2:, 2:], padded[2:, 1:-1], padded[2:, :-2]
+            p8, p9 = padded[1:-1, :-2], padded[:-2, :-2]
+            neighbors = p2.astype(np.uint8) + p3 + p4 + p5 + p6 + p7 + p8 + p9
+            transitions = (
+                ((~p2) & p3).astype(np.uint8) + ((~p3) & p4) + ((~p4) & p5)
+                + ((~p5) & p6) + ((~p6) & p7) + ((~p7) & p8)
+                + ((~p8) & p9) + ((~p9) & p2)
+            )
+            removable = image & (neighbors >= 2) & (neighbors <= 6) & (transitions == 1)
+            if first_pass:
+                removable &= ~(p2 & p4 & p6)
+                removable &= ~(p4 & p6 & p8)
+            else:
+                removable &= ~(p2 & p4 & p8)
+                removable &= ~(p2 & p6 & p8)
+            if np.any(removable):
+                image[removable] = False
+                changed = True
+        if not changed:
+            break
+    return image
+
+
+def trace_centerlines(gray: np.ndarray, settings: LineDrawSettings) -> list[Polyline]:
+    """Threshold dark artwork and trace its medial, single-stroke skeleton."""
+    threshold = int(_clamp(settings.contour_high_threshold, 1, 255))
+    skeleton = _thin_binary_linework(gray <= threshold)
+    lines = _trace_binary_lines(skeleton)
+    minimum_length = float(_clamp(settings.minimum_contour_length, 0.0, 100000.0))
+    tolerance = float(_clamp(settings.contour_simplify, 0.0, 20.0))
+    result: list[Polyline] = []
+    for line in lines:
+        closed = len(line) > 3 and line[0] == line[-1]
+        simplified = _simplify_line(line, tolerance, closed=closed)
+        if _polyline_length(simplified) >= minimum_length:
+            result.append(simplified)
+    return result
+
+
 def _trace_segment_graph(segments: Iterable[tuple[Point, Point]]) -> list[Polyline]:
     adjacency: dict[Point, list[Point]] = {}
     for start, end in segments:
@@ -380,12 +429,15 @@ def convert_image(image: Image.Image, filename: str, settings: LineDrawSettings)
         "silhouette": "contour",
     }
     mode = aliases.get(mode, mode)
-    if mode not in {"contour", "hatch", "contour-hatch"}:
-        raise ValueError("Conversion mode must be contour, hatch, or contour-hatch.")
+    if mode not in {"contour", "centerline", "hatch", "contour-hatch", "centerline-hatch"}:
+        raise ValueError("Conversion mode must be contour, centerline, hatch, contour-hatch, or centerline-hatch.")
 
     prepared = _prepare_raster(image, settings)
-    contours = trace_contours(prepared.gray, settings) if mode in {"contour", "contour-hatch"} else []
-    hatches = generate_hatches(prepared.gray, settings) if mode in {"hatch", "contour-hatch"} else []
+    if mode in {"centerline", "centerline-hatch"}:
+        contours = trace_centerlines(prepared.gray, settings)
+    else:
+        contours = trace_contours(prepared.gray, settings) if mode in {"contour", "contour-hatch"} else []
+    hatches = generate_hatches(prepared.gray, settings) if mode in {"hatch", "contour-hatch", "centerline-hatch"} else []
 
     stroke_count = len(contours) + len(hatches)
     point_count = sum(len(line) for line in contours) + sum(len(line) for line in hatches)

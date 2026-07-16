@@ -59,7 +59,7 @@ const MM_PER_CSS_PIXEL = 25.4 / 96;
 const MAX_BRIGHTNESS_MAP_DIMENSION = 4096;
 const INKSCAPE_NAMESPACE = 'http://www.inkscape.org/namespaces/inkscape';
 const SIDEBAR_SECTION_IDS = ['machineSection', 'importSection', 'generateSection'];
-const MACHINE_SETUP_FIELD_IDS = ['bedX', 'bedY', 'workspaceOrigin', 'zMode', 'zUp', 'zDown', 'xyFeedRate', 'zPlungeRate'];
+const MACHINE_SETUP_FIELD_IDS = ['bedX', 'bedY', 'workspaceOrigin', 'zMode', 'zUp', 'zDown', 'xyFeedRate', 'zPlungeRate', 'startGcode', 'endGcode'];
 const MACHINE_SETTING_IDS = [
     'bedX',
     'bedY',
@@ -69,10 +69,13 @@ const MACHINE_SETTING_IDS = [
     'zDown',
     'xyFeedRate',
     'zPlungeRate',
+    'startGcode',
+    'endGcode',
     'penThickness',
     'densityFudge',
     'brightnessCutoff',
     'generationMode',
+    'outlineTraceMethod',
     'patternLayout',
     'waveform',
     'patternCenterX',
@@ -93,6 +96,8 @@ const GENERATION_FIELD_TOOLTIPS = {
     zDown: 'Pen-down value. In stepper mode this is the drawing Z height; in Servo/PWM mode it is the output value used to press or lower the pen.',
     xyFeedRate: 'Drawing and travel speed for XY moves in millimeters per minute. This changes execution speed, not hatch geometry.',
     zPlungeRate: 'Pen-lift and pen-lower speed in millimeters per minute when using stepper Z mode.',
+    startGcode: 'Optional machine-specific commands emitted before HatchPlot sets units, absolute positioning, and pen-up state.',
+    endGcode: 'Optional machine-specific commands emitted after HatchPlot lifts the pen and returns to machine zero.',
     svgScale: 'Uniformly scales the source artwork before brightness sampling. Larger values expose more source detail but may exceed the machine bounds.',
     svgRotate: 'Rotates the source artwork around its center before brightness sampling and toolpath generation.',
     svgPosX: 'Machine-space X coordinate of the transformed SVG center. Moving it changes which pixels are sampled at each toolpath point.',
@@ -100,7 +105,8 @@ const GENERATION_FIELD_TOOLTIPS = {
     penThickness: 'Physical pen-tip width. It sets the minimum useful carrier step-over and preview stroke width; an accurate value helps avoid redundant, muddy lines.',
     densityFudge: 'Biases sampled darkness before density gating. Positive values retain more carriers for a darker result; negative values suppress carriers for a lighter, cleaner result.',
     brightnessCutoff: 'Minimum adjusted darkness required to draw. Raising it removes more pale gray detail and noise; lowering it preserves fainter tones.',
-    generationMode: 'Brightness Hatch converts grayscale into density-modulated carriers. Outline Trace follows native SVG vectors. Outline then Hatch plots those vectors first and then adds the selected grayscale hatch.',
+    generationMode: 'Brightness Hatch converts grayscale into density-modulated carriers. Outline Trace follows native boundaries or scanned centerlines. Outline then Hatch plots that trace first and then adds the selected grayscale hatch.',
+    outlineTraceMethod: 'Shape boundaries follow native SVG geometry. Centerlines rasterize the visible artwork and skeletonize each mark into a single plotter stroke.',
     patternLayout: 'Selects the base carrier geometry used to traverse the brightness map. Hover the help icon after choosing a layout for a description of that layout.',
     waveform: 'Selects the shape displaced around each base carrier. Hover the help icon after choosing a waveform for a description of that waveform.',
     patternSpacing: 'Nominal distance between adjacent layout carriers before brightness-based density gating. Smaller spacing captures more detail but creates more lines and G-code.',
@@ -122,8 +128,12 @@ const SELECT_OPTION_TOOLTIPS = {
     },
     generationMode: {
         hatch: 'Creates brightness-driven hatching or waveform carriers. Darker regions retain more lines and lighter regions retain fewer.',
-        outline: 'Traces native SVG vector geometry without rasterizing it. Stroked paths follow their centerlines and filled shapes follow their vector boundaries. Pattern, waveform, and brightness controls are ignored.',
-        'outline-hatch': 'Plots native SVG vector outlines first, then plots the brightness-driven hatch paths using the selected layout and waveform.'
+        outline: 'Traces either native SVG boundaries or scan-engine centerlines. Pattern, waveform, and brightness controls are ignored.',
+        'outline-hatch': 'Plots the selected boundary or centerline trace first, then plots brightness-driven hatch paths.'
+    },
+    outlineTraceMethod: {
+        boundary: 'Follows native vector strokes and the edges of filled shapes.',
+        centerline: 'Uses the scan engine to reduce visible marks and filled linework to one-pixel skeletons, then traces those centerlines.'
     },
     patternLayout: {
         linear: 'Parallel carriers crossing the artwork. This is the most predictable general-purpose layout; Pattern Angle controls their orientation.',
@@ -1189,7 +1199,7 @@ function installGenerationTooltips() {
             if (descriptions[option.value]) option.title = descriptions[option.value];
         });
 
-        if (['generationMode', 'patternLayout', 'waveform'].includes(selectId)) {
+        if (['generationMode', 'outlineTraceMethod', 'patternLayout', 'waveform'].includes(selectId)) {
             let descriptionNode = document.getElementById(`${selectId}OptionDescription`);
             if (!descriptionNode) {
                 descriptionNode = document.createElement('div');
@@ -1207,12 +1217,14 @@ function updateGenerationModeVisibility() {
     const hatchControls = document.getElementById('hatchModeControls');
     const outlineHelp = document.getElementById('outlineModeHelp');
     const outlineHatchHelp = document.getElementById('outlineHatchModeHelp');
+    const outlineTraceMethodGroup = document.getElementById('outlineTraceMethodGroup');
     const generateButton = document.getElementById('generateBtn');
     const hatchEnabled = generationModeUsesHatch(mode);
     const outlineOnly = mode === 'outline';
     if (hatchControls) hatchControls.hidden = !hatchEnabled;
     if (outlineHelp) outlineHelp.hidden = !outlineOnly;
     if (outlineHatchHelp) outlineHatchHelp.hidden = mode !== 'outline-hatch';
+    if (outlineTraceMethodGroup) outlineTraceMethodGroup.hidden = !generationModeUsesOutline(mode);
     if (generateButton) {
         generateButton.textContent = outlineOnly
             ? 'Trace SVG Outlines'
@@ -1226,6 +1238,7 @@ function updateGenerationModeVisibility() {
         scheduleBrightnessCutoffPreview(0);
     }
     updateSelectOptionTooltip('generationMode');
+    updateSelectOptionTooltip('outlineTraceMethod');
 }
 
 function updatePatternControlVisibility() {
@@ -1426,6 +1439,15 @@ document.getElementById('generationMode').addEventListener('change', () => {
         : mode === 'outline-hatch'
             ? 'Outline then Hatch selected. Vector borders will plot first, followed by brightness-driven hatching.'
             : 'Brightness Hatch mode selected. Tone controls local line density.';
+});
+
+document.getElementById('outlineTraceMethod').addEventListener('change', () => {
+    saveMachineSettings();
+    updateSelectOptionTooltip('outlineTraceMethod');
+    const method = document.getElementById('outlineTraceMethod').value;
+    document.getElementById('generationStatus').textContent = method === 'centerline'
+        ? 'Centerline scan selected. Visible marks will be skeletonized into single-stroke traces.'
+        : 'Boundary trace selected. Native SVG strokes and filled-shape edges will be followed.';
 });
 
 MACHINE_SETTING_IDS.filter(id => !['bedX', 'bedY', 'workspaceOrigin', 'generationMode'].includes(id)).forEach(id => {
@@ -1982,6 +2004,8 @@ function currentGcodeSettings() {
         zDown: document.getElementById('zDown').value,
         xyFeedRate: Number.parseInt(document.getElementById('xyFeedRate').value, 10) || 2000,
         zPlungeRate: Number.parseInt(document.getElementById('zPlungeRate').value, 10) || 300,
+        startGcode: document.getElementById('startGcode').value,
+        endGcode: document.getElementById('endGcode').value,
         penThickness: readPositiveNumber('penThickness', 0.5),
         svgScale: Number.parseFloat(document.getElementById('svgScale').value) || 100,
         svgScaleMode: 'absolute',
@@ -2000,6 +2024,7 @@ function currentGcodeSettings() {
         waveAmplitude: Math.max(0, Number.parseFloat(document.getElementById('waveAmplitude').value) || 0),
         waveLength: readPositiveNumber('waveLength', 3),
         brightnessModulation: document.getElementById('brightnessModulation').value,
+        outlineTraceMethod: document.getElementById('outlineTraceMethod').value,
     };
 }
 
@@ -2122,11 +2147,9 @@ function buildGcodeHeader(settings, pathCount = null) {
         `SVG transform: scale=${gcodeFixed(settings.svgScale)}% (${gcodeCommentValue(settings.svgScaleMode)}); rotation=${gcodeFixed(settings.svgRotate)} deg; center=(${gcodeFixed(settings.svgPosX)}, ${gcodeFixed(settings.svgPosY)}) mm`,
     ];
     if (generationModeUsesOutline(settings.generationMode)) {
-        comments.push(
-            'Outline: traces native SVG vector geometry; stroked paths ' +
-            'follow their centerlines and filled shapes follow their ' +
-            'vector boundaries'
-        );
+        comments.push(settings.outlineTraceMethod === 'centerline'
+            ? 'Outline: scan-engine centerline extraction from visible artwork'
+            : 'Outline: native SVG strokes and filled-shape vector boundaries');
     }
     if (generationModeUsesHatch(settings.generationMode)) {
         comments.push(
@@ -2137,7 +2160,7 @@ function buildGcodeHeader(settings, pathCount = null) {
     }
     if (settings.generationMode === 'outline-hatch') {
         comments.push(
-            'Sequence: native SVG outlines are plotted first, followed ' +
+            'Sequence: selected outline traces are plotted first, followed ' +
             'by brightness-driven hatch paths'
         );
     }
@@ -2146,7 +2169,8 @@ function buildGcodeHeader(settings, pathCount = null) {
         'End HatchPlot header'
     );
 
-    const lines = comments.flatMap(gcodeCommentLines);
+    const lines = String(settings.startGcode || '').split(/\r?\n/).filter(line => line.trim().length > 0);
+    lines.push(...comments.flatMap(gcodeCommentLines));
     lines.push(
         'G21',
         'G90',
@@ -2301,7 +2325,9 @@ async function buildGenerationFormData(penThickness) {
         waveLength = Number.isFinite(waveLength) && waveLength >= 0.05 ? waveLength : 3;
     }
 
-    const renderedSourceMap = generationModeUsesHatch(generationMode)
+    const renderedSourceMap = (generationModeUsesHatch(generationMode) || (
+        generationModeUsesOutline(generationMode) && document.getElementById('outlineTraceMethod').value === 'centerline'
+    ))
         ? await renderBrightnessMap(penThickness)
         : null;
     const svgCenter = getSvgCanvasCenter();
@@ -2316,6 +2342,7 @@ async function buildGenerationFormData(penThickness) {
     formData.append('bedY', document.getElementById('bedY').value);
     formData.append('workspaceOrigin', getWorkspaceOrigin());
     formData.append('generationMode', generationMode);
+    formData.append('outlineTraceMethod', document.getElementById('outlineTraceMethod').value);
     formData.append('svgScale', document.getElementById('svgScale').value);
     formData.append('svgScaleMode', 'absolute');
     formData.append('svgRotate', document.getElementById('svgRotate').value);
@@ -2328,6 +2355,8 @@ async function buildGenerationFormData(penThickness) {
     formData.append('zDown', document.getElementById('zDown').value);
     formData.append('xyFeedRate', document.getElementById('xyFeedRate').value);
     formData.append('zPlungeRate', document.getElementById('zPlungeRate').value);
+    formData.append('startGcode', document.getElementById('startGcode').value);
+    formData.append('endGcode', document.getElementById('endGcode').value);
     formData.append('penThickness', formatNumber(penThickness, 4));
     formData.append('densityFudge', formatNumber(densityFudge, 3));
     formData.append('brightnessCutoff', formatNumber(brightnessCutoff, 3));
