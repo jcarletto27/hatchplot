@@ -4,6 +4,7 @@ import asyncio
 import base64
 import ftplib
 import hashlib
+import http.client
 import io
 import json
 import logging
@@ -13,9 +14,7 @@ import ssl
 import threading
 import textwrap
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from multiprocessing import Manager
 import traceback
 import uuid
@@ -193,13 +192,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Keep WebDAV credentials from being forwarded to another origin."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
-        return None
-
-
 def _network_gcode_bytes(gcode: str) -> bytes:
     content = str(gcode).rstrip("\r\n") + "\n"
     encoded = content.encode("utf-8")
@@ -228,6 +220,10 @@ def _webdav_target_url(base_url: str, filename: str) -> str:
     parsed = urllib.parse.urlsplit(str(base_url).strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise NetworkDeliveryError("Enter a complete WebDAV folder URL beginning with http:// or https://.")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise NetworkDeliveryError("The WebDAV URL contains an invalid port.") from exc
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise NetworkDeliveryError("The WebDAV URL cannot contain credentials, a query string, or a fragment.")
     folder_path = parsed.path.rstrip("/") + "/"
@@ -237,32 +233,46 @@ def _webdav_target_url(base_url: str, filename: str) -> str:
 
 def _deliver_webdav(payload: GcodeDeliveryRequest, content: bytes, filename: str) -> str:
     target_url = _webdav_target_url(payload.url, filename)
-    headers = {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Content-Length": str(len(content)),
-        "User-Agent": "HatchPlot/2.5",
-    }
+    parsed = urllib.parse.urlsplit(target_url)
+    request_path = urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, ""))
+    headers = [
+        ("Content-Type", "text/plain; charset=utf-8"),
+        # Preserve this exact spelling. Some embedded WebDAV/SD-card servers
+        # incorrectly treat HTTP header names as case-sensitive and interpret
+        # urllib's normalized `Content-length` spelling as a zero-byte PUT.
+        ("Content-Length", str(len(content))),
+        ("User-Agent", "HatchPlot/2.5"),
+        ("Connection", "close"),
+    ]
     if payload.username or payload.password:
         credentials = f"{payload.username}:{payload.password}".encode("utf-8")
-        headers["Authorization"] = "Basic " + base64.b64encode(credentials).decode("ascii")
+        headers.append(("Authorization", "Basic " + base64.b64encode(credentials).decode("ascii")))
 
     context = ssl.create_default_context() if payload.verify_tls else ssl._create_unverified_context()
-    opener = urllib.request.build_opener(
-        _NoRedirectHandler(),
-        urllib.request.HTTPSHandler(context=context),
-    )
-    request = urllib.request.Request(target_url, data=content, headers=headers, method="PUT")
+    connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    connection_kwargs: dict[str, Any] = {
+        "host": parsed.hostname,
+        "port": parsed.port,
+        "timeout": NETWORK_DELIVERY_TIMEOUT_SECONDS,
+    }
+    if parsed.scheme == "https":
+        connection_kwargs["context"] = context
+    connection = connection_class(**connection_kwargs)
     try:
-        with opener.open(request, timeout=NETWORK_DELIVERY_TIMEOUT_SECONDS) as response:
-            response_status = int(getattr(response, "status", response.getcode()))
-    except urllib.error.HTTPError as exc:
-        raise NetworkDeliveryError(f"The WebDAV server rejected the upload with HTTP {exc.code}.") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        reason = getattr(exc, "reason", None)
-        detail = str(reason or exc).strip()[:240]
+        connection.putrequest("PUT", request_path, skip_accept_encoding=True)
+        for header, value in headers:
+            connection.putheader(header, value)
+        connection.endheaders(content)
+        response = connection.getresponse()
+        response_status = int(response.status)
+        response.read(4096)
+    except (http.client.HTTPException, TimeoutError, OSError) as exc:
+        detail = str(exc).strip()[:240]
         raise NetworkDeliveryError(f"Unable to reach the WebDAV server: {detail}") from exc
+    finally:
+        connection.close()
     if response_status not in {200, 201, 204}:
-        raise NetworkDeliveryError(f"The WebDAV server returned unexpected HTTP {response_status}.")
+        raise NetworkDeliveryError(f"The WebDAV server rejected the upload with HTTP {response_status}.")
     return target_url
 
 

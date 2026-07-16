@@ -40,10 +40,12 @@ class NetworkDeliveryValidationTests(unittest.TestCase):
 
 
 class NetworkDeliveryClientTests(unittest.TestCase):
-    @patch("main.urllib.request.build_opener")
-    def test_webdav_uses_put_with_basic_auth(self, build_opener: MagicMock) -> None:
-        response = build_opener.return_value.open.return_value.__enter__.return_value
+    @patch("main.http.client.HTTPSConnection")
+    def test_webdav_uses_put_with_exact_content_length_header(self, connection_factory: MagicMock) -> None:
+        connection = connection_factory.return_value
+        response = connection.getresponse.return_value
         response.status = 201
+        response.read.return_value = b""
         payload = GcodeDeliveryRequest(
             protocol="webdav",
             filename="drawing.nc",
@@ -56,10 +58,20 @@ class NetworkDeliveryClientTests(unittest.TestCase):
         destination = _deliver_webdav(payload, b"G0 X0 Y0\n", "drawing.nc")
 
         self.assertEqual(destination, "https://plotter.local/dav/drawing.nc")
-        request = build_opener.return_value.open.call_args.args[0]
-        self.assertEqual(request.method, "PUT")
-        self.assertEqual(request.data, b"G0 X0 Y0\n")
-        self.assertTrue(request.headers["Authorization"].startswith("Basic "))
+        connection.putrequest.assert_called_once_with("PUT", "/dav/drawing.nc", skip_accept_encoding=True)
+        self.assertIn(
+            (("Content-Length", str(len(b"G0 X0 Y0\n"))), {}),
+            [(call.args, call.kwargs) for call in connection.putheader.call_args_list],
+        )
+        authorization_calls = [
+            call.args[1]
+            for call in connection.putheader.call_args_list
+            if call.args[0] == "Authorization"
+        ]
+        self.assertEqual(len(authorization_calls), 1)
+        self.assertTrue(authorization_calls[0].startswith("Basic "))
+        connection.endheaders.assert_called_once_with(b"G0 X0 Y0\n")
+        connection.close.assert_called_once_with()
 
     @patch("main.ftplib.FTP")
     def test_ftp_uploads_to_selected_directory(self, ftp_factory: MagicMock) -> None:
