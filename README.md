@@ -95,7 +95,7 @@ docker compose -f compose.gpu.yml up -d
 
 After generating a toolpath, expand **WebDAV / FTP delivery** below the G-code preview. HatchPlot can upload the current `.nc` file with WebDAV `PUT`, plain FTP, or explicit FTPS. Connection details are stored in the browser; passwords are used only for the current page session and are never saved.
 
-The backend container must be able to resolve and connect to the destination. Configure delivery with `NETWORK_DELIVERY_ENABLED`, `NETWORK_DELIVERY_TIMEOUT_SECONDS`, and `MAX_NETWORK_GCODE_BYTES` in `.env`.
+The backend uses the host's Avahi daemon to resolve `.local` devices such as `plotter.local` while retaining Docker networking for reverse proxies. The host Avahi socket must exist at `/run/avahi-daemon/socket`. Configure delivery with `NETWORK_DELIVERY_ENABLED`, `NETWORK_DELIVERY_TIMEOUT_SECONDS`, and `MAX_NETWORK_GCODE_BYTES` in `.env`.
 
 ## Licenses
 

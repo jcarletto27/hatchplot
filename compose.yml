@@ -5,6 +5,15 @@ services:
     container_name: hatch-plotter-api
     ports:
       - "${BACKEND_PORT:-8000}:8000"
+    # Use the host Avahi daemon for mDNS names such as plotter.local while
+    # retaining Docker networking for reverse-proxy compatibility.
+    volumes:
+      - type: bind
+        source: /run/avahi-daemon/socket
+        target: /run/avahi-daemon/socket
+        read_only: true
+        bind:
+          create_host_path: false
     environment:
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       JOB_WORKERS: "${JOB_WORKERS:-1}"
