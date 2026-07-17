@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import queue
 import ssl
 import threading
 import textwrap
@@ -21,14 +22,14 @@ import uuid
 from concurrent.futures import CancelledError, Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import asynccontextmanager
-from typing import Any, Iterable, MutableMapping
+from typing import Any, Callable, Iterable, MutableMapping
 
 import cv2
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from linedraw_engine import LineDrawSettings, convert_image
@@ -87,7 +88,7 @@ converter_transfers_lock = threading.Lock()
 CONVERTER_TRANSFER_TTL_SECONDS = max(60, int(os.getenv("CONVERTER_TRANSFER_TTL_SECONDS", "900")))
 MAX_CONVERTER_TRANSFERS = max(1, int(os.getenv("MAX_CONVERTER_TRANSFERS", "12")))
 NETWORK_DELIVERY_ENABLED = os.getenv("NETWORK_DELIVERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-NETWORK_DELIVERY_TIMEOUT_SECONDS = max(3, min(300, int(os.getenv("NETWORK_DELIVERY_TIMEOUT_SECONDS", "30"))))
+NETWORK_DELIVERY_TIMEOUT_SECONDS = max(3, min(1800, int(os.getenv("NETWORK_DELIVERY_TIMEOUT_SECONDS", "300"))))
 MAX_NETWORK_GCODE_BYTES = max(1024, int(os.getenv("MAX_NETWORK_GCODE_BYTES", str(10 * 1024 * 1024))))
 
 
@@ -231,7 +232,7 @@ def _webdav_target_url(base_url: str, filename: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, target_path, "", ""))
 
 
-def _deliver_webdav(payload: GcodeDeliveryRequest, content: bytes, filename: str) -> str:
+def _deliver_webdav(payload: GcodeDeliveryRequest, content: bytes, filename: str, progress: Callable[[int, int], None] | None = None) -> str:
     target_url = _webdav_target_url(payload.url, filename)
     parsed = urllib.parse.urlsplit(target_url)
     request_path = urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, ""))
@@ -264,7 +265,14 @@ def _deliver_webdav(payload: GcodeDeliveryRequest, content: bytes, filename: str
         connection.putrequest("PUT", request_path, skip_accept_encoding=True)
         for header, value in headers:
             connection.putheader(header, value)
-        connection.endheaders(content)
+        connection.endheaders()
+        sent = 0
+        for offset in range(0, len(content), 64 * 1024):
+            chunk = content[offset:offset + (64 * 1024)]
+            connection.send(chunk)
+            sent += len(chunk)
+            if progress is not None:
+                progress(sent, len(content))
         response = connection.getresponse()
         response_status = int(response.status)
         response.read(4096)
@@ -292,7 +300,7 @@ def _ftp_directory(directory: str) -> str:
     return cleaned
 
 
-def _deliver_ftp(payload: GcodeDeliveryRequest, content: bytes, filename: str) -> str:
+def _deliver_ftp(payload: GcodeDeliveryRequest, content: bytes, filename: str, progress: Callable[[int, int], None] | None = None) -> str:
     host = _ftp_host(payload.host)
     directory = _ftp_directory(payload.directory)
     port = payload.port or 21
@@ -309,7 +317,13 @@ def _deliver_ftp(payload: GcodeDeliveryRequest, content: bytes, filename: str) -
         client.set_pasv(payload.passive)
         if directory:
             client.cwd(directory)
-        client.storbinary(f"STOR {filename}", io.BytesIO(content))
+        sent = 0
+        def report_chunk(chunk: bytes) -> None:
+            nonlocal sent
+            sent += len(chunk)
+            if progress is not None:
+                progress(sent, len(content))
+        client.storbinary(f"STOR {filename}", io.BytesIO(content), callback=report_chunk)
         try:
             client.quit()
         except ftplib.all_errors:
@@ -326,16 +340,16 @@ def _deliver_ftp(payload: GcodeDeliveryRequest, content: bytes, filename: str) -
     return f"{scheme}://{host}:{port}/{remote_path}"
 
 
-def deliver_gcode_file(payload: GcodeDeliveryRequest) -> dict[str, Any]:
+def deliver_gcode_file(payload: GcodeDeliveryRequest, progress: Callable[[int, int], None] | None = None) -> dict[str, Any]:
     if not NETWORK_DELIVERY_ENABLED:
         raise NetworkDeliveryError("Network G-code delivery is disabled by the server administrator.")
     filename = _safe_delivery_filename(payload.filename)
     content = _network_gcode_bytes(payload.gcode)
     protocol = payload.protocol.strip().lower()
     if protocol == "webdav":
-        destination = _deliver_webdav(payload, content, filename)
+        destination = _deliver_webdav(payload, content, filename, progress)
     elif protocol == "ftp":
-        destination = _deliver_ftp(payload, content, filename)
+        destination = _deliver_ftp(payload, content, filename, progress)
     else:
         raise NetworkDeliveryError("Protocol must be webdav or ftp.")
     return {
@@ -3334,6 +3348,36 @@ def deliver_gcode(payload: GcodeDeliveryRequest) -> dict[str, Any]:
         result["destination"],
     )
     return result
+
+
+@app.post("/gcode/deliver-stream")
+def deliver_gcode_stream(payload: GcodeDeliveryRequest) -> StreamingResponse:
+    events: queue.Queue[dict[str, Any]] = queue.Queue()
+
+    def report_progress(sent: int, total: int) -> None:
+        events.put({"status": "uploading", "sent": sent, "total": total})
+
+    def run_delivery() -> None:
+        try:
+            events.put({"status": "connecting"})
+            events.put(deliver_gcode_file(payload, report_progress))
+        except NetworkDeliveryError as exc:
+            events.put({"status": "error", "detail": str(exc)})
+        except Exception:
+            logger.exception("Unexpected streaming network delivery failure")
+            events.put({"status": "error", "detail": "The network upload failed unexpectedly."})
+
+    def stream_events() -> Iterable[bytes]:
+        threading.Thread(target=run_delivery, daemon=True).start()
+        while True:
+            event = events.get()
+            yield (json.dumps(event) + "\n").encode("utf-8")
+            if event.get("status") in {"sent", "error"}:
+                break
+
+    return StreamingResponse(stream_events(), media_type="application/x-ndjson", headers={
+        "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+    })
 
 
 @app.post("/jobs", status_code=status.HTTP_202_ACCEPTED)

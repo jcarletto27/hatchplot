@@ -74,7 +74,8 @@ class NetworkDeliveryClientTests(unittest.TestCase):
         ]
         self.assertEqual(len(authorization_calls), 1)
         self.assertTrue(authorization_calls[0].startswith("Basic "))
-        connection.endheaders.assert_called_once_with(b"G0 X0 Y0\n")
+        connection.endheaders.assert_called_once_with()
+        connection.send.assert_called_once_with(b"G0 X0 Y0\n")
         connection.close.assert_called_once_with()
 
     @patch("main.ftplib.FTP")

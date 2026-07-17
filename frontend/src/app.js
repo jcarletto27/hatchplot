@@ -2018,14 +2018,40 @@ async function sendGcodeToNetwork() {
     updateExportAvailability();
     statusNode.textContent = `Sending ${payload.filename} via ${payload.protocol === 'ftp' && payload.ftp_tls ? 'FTPS' : payload.protocol.toUpperCase()}…`;
     try {
-        const response = await fetch('/api/gcode/deliver', {
+        const response = await fetch('/api/gcode/deliver-stream', {
             method: 'POST',
             cache: 'no-store',
             headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
         if (!response.ok) throw new Error(await readApiError(response));
-        const result = await response.json();
+        if (!response.body) throw new Error('Upload status is unavailable in this browser.');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffered = '';
+        let result = null;
+        while (true) {
+            const { value, done } = await reader.read();
+            buffered += decoder.decode(value || new Uint8Array(), { stream: !done });
+            const lines = buffered.split('\n');
+            buffered = lines.pop() || '';
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                const event = JSON.parse(line);
+                if (event.status === 'connecting') {
+                    statusNode.textContent = `Connecting to ${payload.protocol.toUpperCase()} server…`;
+                } else if (event.status === 'uploading') {
+                    const percent = event.total ? Math.round((event.sent / event.total) * 100) : 0;
+                    statusNode.textContent = `Uploading ${payload.filename}… ${percent}% (${Number(event.sent).toLocaleString()} of ${Number(event.total).toLocaleString()} bytes)`;
+                } else if (event.status === 'error') {
+                    throw new Error(event.detail || 'The network upload failed.');
+                } else if (event.status === 'sent') {
+                    result = event;
+                }
+            }
+            if (done) break;
+        }
+        if (!result) throw new Error('The upload ended without a completion response.');
         statusNode.textContent = `Sent ${result.filename} (${Number(result.bytes).toLocaleString()} bytes) to ${result.destination}.`;
     } catch (error) {
         console.error('Network G-code delivery failed:', error);
