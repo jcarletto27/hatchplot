@@ -118,6 +118,41 @@ class CustomGcodeTests(unittest.TestCase):
         self.assertEqual(gcode_lines[header_end + 1:header_end + 3], ["M17", "; fixture ready"])
         self.assertEqual(gcode_lines[-2:], ["M5", "M18"])
 
+    def test_single_line_raster_has_one_pen_down_path(self) -> None:
+        pixels = np.full((32, 32), 255, dtype=np.uint8)
+        pixels[8:24, 8:24] = 0
+        self.params.update({
+            "bedX": 20.0,
+            "bedY": 20.0,
+            "svgPosX": 10.0,
+            "svgPosY": 10.0,
+            "generationMode": "single-line",
+            "patternLayout": "linear",
+            "waveform": "ekg",
+            "patternCenterX": 10.0,
+            "patternCenterY": 10.0,
+            "patternAngle": 0.0,
+            "patternSpacing": 1.0,
+            "patternClockwise": True,
+            "waveAmplitude": 0.4,
+            "waveLength": 2.0,
+            "brightnessModulation": "both",
+        })
+
+        result = generate_toolpath(
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"/>',
+            self.params,
+            _png_bytes(pixels),
+        )
+
+        self.assertEqual(len(result["paths"]), 1)
+        self.assertGreater(len(result["paths"][0]), 100)
+        self.assertEqual(result["stats"]["continuous_paths"], 1)
+        self.assertEqual(result["stats"]["pen_lifts_during_image"], 0)
+        lines = result["gcode"].splitlines()
+        self.assertEqual(lines.count("G1 Z0 F300"), 1)
+        self.assertEqual(lines.count("G0 Z5"), 2)
+
 
 def _png_bytes(pixels: np.ndarray) -> bytes:
     buffer = io.BytesIO()

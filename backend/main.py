@@ -627,14 +627,14 @@ def validate_generation_params(params: dict[str, Any]) -> None:
         raise GenerationError("penThickness must be between 0.05 and 10 mm.")
 
     generation_mode = str(params.get("generationMode", "hatch"))
-    if generation_mode not in {"hatch", "outline", "outline-hatch"}:
-        raise GenerationError("generationMode must be hatch, outline, or outline-hatch.")
+    if generation_mode not in {"hatch", "single-line", "outline", "outline-hatch"}:
+        raise GenerationError("generationMode must be hatch, single-line, outline, or outline-hatch.")
     if params.get("outlineTraceMethod", "boundary") not in {"boundary", "centerline"}:
         raise GenerationError("outlineTraceMethod must be boundary or centerline.")
     if params.get("workspaceOrigin", "top-left") not in {"top-left", "top-right", "bottom-left", "bottom-right"}:
         raise GenerationError("workspaceOrigin must be top-left, top-right, bottom-left, or bottom-right.")
 
-    if generation_mode in {"hatch", "outline-hatch"}:
+    if generation_mode in {"hatch", "single-line", "outline-hatch"}:
         density_fudge = float(params.get("densityFudge", 0.0))
         if not math.isfinite(density_fudge) or not -0.5 <= density_fudge <= 0.5:
             raise GenerationError("densityFudge must be between -0.5 and 0.5.")
@@ -645,8 +645,11 @@ def validate_generation_params(params: dict[str, Any]) -> None:
 
         if params.get("patternLayout", "linear") not in {"linear", "spiral", "concentric", "radial"}:
             raise GenerationError("patternLayout must be linear, spiral, concentric, or radial.")
-        if params.get("waveform", "zigzag") not in {"zigzag", "sawtooth", "sine", "ekg", "straight"}:
-            raise GenerationError("waveform must be zigzag, sawtooth, sine, ekg, or straight.")
+        allowed_waveforms = {"zigzag", "sawtooth", "sine", "ekg", "straight", "swirl"}
+        if params.get("waveform", "zigzag") not in allowed_waveforms:
+            raise GenerationError("waveform must be zigzag, sawtooth, sine, ekg, swirl, or straight.")
+        if generation_mode == "single-line" and params.get("patternLayout", "linear") not in {"linear", "concentric"}:
+            raise GenerationError("Single Line layout must be linear or concentric.")
         if params.get("brightnessModulation", "both") not in {"both", "amplitude", "frequency", "none"}:
             raise GenerationError("brightnessModulation must be both, amplitude, frequency, or none.")
         for key, minimum, maximum in (
@@ -1681,6 +1684,134 @@ def _generate_brightness_paths(
         "live_preview_points": preview_state["points"],
     }
 
+
+def _generate_single_line_path(
+    brightness_map: bytes,
+    params: dict[str, Any],
+    progress: MutableMapping[str, Any] | None = None,
+    preview_queue: Any | None = None,
+) -> tuple[list[list[list[float]]], dict[str, Any]]:
+    """Raster artwork with one uninterrupted, always-pen-down polyline."""
+    bed_x = float(params["bedX"])
+    bed_y = float(params["bedY"])
+    pen_thickness = float(params.get("penThickness", 0.5))
+    density_fudge = float(params.get("densityFudge", 0.0))
+    cutoff = float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF))
+    layout = str(params.get("patternLayout", "linear"))
+    waveform = str(params.get("waveform", "zigzag"))
+    center_x = float(params.get("patternCenterX", bed_x / 2.0))
+    center_y = float(params.get("patternCenterY", bed_y / 2.0))
+    angle = float(params.get("patternAngle", 0.0))
+    clockwise = bool(params.get("patternClockwise", True))
+    spacing = max(pen_thickness, float(params.get("patternSpacing", pen_thickness * 1.55)))
+    requested_amplitude = max(0.0, float(params.get("waveAmplitude", spacing * 0.4)))
+    # Non-looping textures remain inside their lane, preventing adjacent passes
+    # from crossing. Swirl overlap is deliberate density, so it may use full size.
+    amplitude = requested_amplitude if waveform == "swirl" else min(requested_amplitude, spacing * 0.45)
+    wave_length = max(pen_thickness * 2.0, float(params.get("waveLength", pen_thickness * 6.0)))
+    brightness_mode = str(params.get("brightnessModulation", "both"))
+
+    _set_progress(progress, phase="decoding", percent=2.0, detail="Decoding the single-line brightness map...")
+    try:
+        image = Image.open(io.BytesIO(brightness_map))
+        image.load()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise GenerationError(f"Unable to read the generated brightness map: {exc}") from exc
+    if image.width * image.height > MAX_BRIGHTNESS_MAP_PIXELS:
+        raise GenerationLimitError(f"The brightness map contains more than {MAX_BRIGHTNESS_MAP_PIXELS:,} pixels.")
+
+    rgba = image.convert("RGBA")
+    pixel_mm = max(bed_x / max(1, rgba.width - 1), bed_y / max(1, rgba.height - 1))
+    sample_step = max(pen_thickness * 0.4, pixel_mm, 0.05)
+    carrier_layout = "spiral" if layout == "concentric" else "linear"
+    carriers = _build_pattern_carriers(
+        carrier_layout, bed_x, bed_y, center_x, center_y, spacing,
+        sample_step, angle, clockwise,
+    )
+
+    # Keep only in-bed portions, retaining serpentine carrier order. Joining
+    # their endpoints makes one continuous raster path with no pen lifts.
+    base: list[tuple[float, float]] = []
+    for carrier in carriers:
+        inside = [point for point in carrier if 0.0 <= point[0] <= bed_x and 0.0 <= point[1] <= bed_y]
+        if len(inside) < 2:
+            continue
+        if base and math.dist(base[-1], inside[0]) > sample_step:
+            base.extend(_sample_segment(base[-1], inside[0], sample_step)[1:])
+        base.extend(inside if not base else inside[1:])
+    if len(base) < 2:
+        raise GenerationError("Unable to fit a continuous raster line inside the workspace.")
+    if len(base) > MAX_TOOLPATH_POINTS:
+        final_base_point = base[-1]
+        stride = int(math.ceil(len(base) / MAX_TOOLPATH_POINTS))
+        base = base[::stride]
+        if base[-1] != final_base_point:
+            base.append(final_base_point)
+
+    darkness_sets, compute_backend = _sample_carrier_darkness(rgba, [base], bed_x, bed_y, progress)
+    darkness_values = darkness_sets[0]
+    points: list[list[float]] = []
+    phase = 0.0
+    previous = base[0]
+    total = len(base)
+    for index, (point, raw_darkness) in enumerate(zip(base, darkness_values, strict=True)):
+        if index % 2048 == 0:
+            _check_cancel_requested(progress)
+            _set_progress(
+                progress, phase="path-building", percent=10.0 + (80.0 * index / total),
+                completed=index, total=total, detail="Building one continuous raster line...",
+                compute_backend=compute_backend,
+            )
+        darkness = max(0.0, min(1.0, float(raw_darkness) * (1.0 + density_fudge)))
+        active_darkness = darkness if darkness >= cutoff else 0.0
+        distance = math.dist(previous, point) if index else 0.0
+        local_wave_length = wave_length
+        if brightness_mode in {"frequency", "both"}:
+            local_wave_length = max(pen_thickness * 2.0, wave_length * (1.6 - active_darkness))
+        phase += distance / local_wave_length
+        previous = point
+        before = base[max(0, index - 1)]
+        after = base[min(total - 1, index + 1)]
+        tangent_x = after[0] - before[0]
+        tangent_y = after[1] - before[1]
+        tangent_length = math.hypot(tangent_x, tangent_y) or 1.0
+        tangent_x /= tangent_length
+        tangent_y /= tangent_length
+        normal_x, normal_y = -tangent_y, tangent_x
+        radius = amplitude * (
+            active_darkness if brightness_mode in {"amplitude", "both"} else float(active_darkness > 0.0)
+        )
+        if waveform == "swirl":
+            radians = phase * math.tau
+            x = point[0] + radius * ((normal_x * math.sin(radians)) + (tangent_x * math.cos(radians)))
+            y = point[1] + radius * ((normal_y * math.sin(radians)) + (tangent_y * math.cos(radians)))
+        else:
+            offset = _waveform_value(waveform, phase) * radius
+            x = point[0] + normal_x * offset
+            y = point[1] + normal_y * offset
+        points.append([round(min(bed_x, max(0.0, x)), 4), round(min(bed_y, max(0.0, y)), 4)])
+
+    if len(points) > MAX_TOOLPATH_POINTS:
+        raise GenerationLimitError(f"The single line exceeded {MAX_TOOLPATH_POINTS:,} toolpath points.")
+    preview_state = {"points": 0, "chunks": 0}
+    _publish_live_preview(preview_queue, [points], preview_state)
+    _set_progress(progress, phase="path-building", percent=92.0, completed=total, total=total, detail="Single line ready; compiling G-code...", compute_backend=compute_backend)
+    return [points], {
+        "source": "browser-brightness-map",
+        "generation_mode": "single-line",
+        "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
+        "map_width": rgba.width,
+        "map_height": rgba.height,
+        "carrier_count": 1,
+        "continuous_paths": 1,
+        "pen_lifts_during_image": 0,
+        "sample_step_mm": round(sample_step, 4),
+        "pattern_spacing_mm": round(spacing, 4),
+        "compute_backend": compute_backend,
+        "gpu_accelerated": compute_backend == "cuda",
+        "live_preview_points": preview_state["points"],
+    }
+
 def _gcode_comment_value(value: Any) -> str:
     text = str(value if value is not None else "")
     return " ".join(text.replace("\r", " ").replace("\n", " ").split())
@@ -1736,6 +1867,7 @@ def _suggest_output_filename(params: dict[str, Any]) -> str:
     generation_codes = {
         "outline": "OUTLINE",
         "hatch": "HATCH",
+        "single-line": "1LINE",
         "outline-hatch": "OTH",
     }
     layout_labels = {
@@ -1750,7 +1882,7 @@ def _suggest_output_filename(params: dict[str, Any]) -> str:
         origin_codes.get(str(params.get("workspaceOrigin", "top-left")), "TL"),
         generation_codes.get(generation_mode, generation_mode.upper() or "HATCH"),
     ]
-    if generation_mode in {"hatch", "outline-hatch"}:
+    if generation_mode in {"hatch", "single-line", "outline-hatch"}:
         layout = str(params.get("patternLayout", "")).strip().lower()
         if layout:
             parts.append(layout_labels.get(layout, layout[:1].upper() + layout[1:]))
@@ -1848,7 +1980,7 @@ def _gcode_preamble(
             if outline_method == "centerline"
             else "Outline: native SVG strokes and filled-shape vector boundaries"
         )
-    if generation_mode in {"hatch", "outline-hatch"}:
+    if generation_mode in {"hatch", "single-line", "outline-hatch"}:
         comments.extend([
             f"Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
             f"Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={float(params.get('patternSpacing', 1.0)):.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({display_center_x:.3f}, {display_center_y:.3f}) mm; direction={direction}",
@@ -1931,6 +2063,8 @@ def generate_toolpath(
     validate_generation_params(params)
 
     generation_mode = str(params.get("generationMode", "hatch"))
+    if generation_mode == "single-line" and brightness_map is None:
+        raise GenerationError("Single Line Raster requires the browser-rendered brightness map.")
     if generation_mode == "outline" and params.get("outlineTraceMethod", "boundary") == "centerline":
         if brightness_map is None:
             raise GenerationError("Centerline outline tracing requires the browser-rendered artwork map.")
@@ -2086,8 +2220,9 @@ def generate_toolpath(
         )
         return result
 
-    if generation_mode == "hatch" and brightness_map is not None:
-        compiled_paths, raster_stats = _generate_brightness_paths(brightness_map, params, progress, preview_queue)
+    if generation_mode in {"hatch", "single-line"} and brightness_map is not None:
+        generator = _generate_single_line_path if generation_mode == "single-line" else _generate_brightness_paths
+        compiled_paths, raster_stats = generator(brightness_map, params, progress, preview_queue)
         _set_progress(
             progress,
             phase="gcode",
@@ -2110,7 +2245,7 @@ def generate_toolpath(
                 "output_filename": _suggest_output_filename(params),
                 "duration_seconds": round(duration, 3),
                 "drawable_elements": None,
-                "hatch_paths": len(compiled_paths),
+                "hatch_paths": len(compiled_paths) if generation_mode == "hatch" else 0,
                 "continuous_paths": len(compiled_paths),
                 "toolpath_points": toolpath_points,
                 "gcode_lines": len(gcode),

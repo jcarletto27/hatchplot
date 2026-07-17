@@ -107,7 +107,7 @@ const GENERATION_FIELD_TOOLTIPS = {
     penThickness: 'Physical pen-tip width. It sets the minimum useful carrier step-over and preview stroke width; an accurate value helps avoid redundant, muddy lines.',
     densityFudge: 'Biases sampled darkness before density gating. Positive values retain more carriers for a darker result; negative values suppress carriers for a lighter, cleaner result.',
     brightnessCutoff: 'Minimum adjusted darkness required to draw. Raising it removes more pale gray detail and noise; lowering it preserves fainter tones.',
-    generationMode: 'Brightness Hatch converts grayscale into density-modulated carriers. Outline Trace follows native boundaries or scanned centerlines. Outline then Hatch plots that trace first and then adds the selected grayscale hatch.',
+    generationMode: 'Brightness Hatch creates separate tonal carriers. Single Line Raster keeps one uninterrupted pen-down path. Outline modes trace visible geometry.',
     outlineTraceMethod: 'Shape boundaries follow native SVG geometry. Centerlines rasterize the visible artwork and skeletonize each mark into a single plotter stroke.',
     patternLayout: 'Selects the base carrier geometry used to traverse the brightness map. Hover the help icon after choosing a layout for a description of that layout.',
     waveform: 'Selects the shape displaced around each base carrier. Hover the help icon after choosing a waveform for a description of that waveform.',
@@ -130,6 +130,7 @@ const SELECT_OPTION_TOOLTIPS = {
     },
     generationMode: {
         hatch: 'Creates brightness-driven hatching or waveform carriers. Darker regions retain more lines and lighter regions retain fewer.',
+        'single-line': 'Rasters the full image as one uninterrupted serpentine or spiral path. Brightness adds texture without pen lifts.',
         outline: 'Traces either native SVG boundaries or scan-engine centerlines. Pattern, waveform, and brightness controls are ignored.',
         'outline-hatch': 'Plots the selected boundary or centerline trace first, then plots brightness-driven hatch paths.'
     },
@@ -148,6 +149,7 @@ const SELECT_OPTION_TOOLTIPS = {
         sawtooth: 'A directional ramp followed by a rapid reset. Produces a visibly directional, engraved texture.',
         sine: 'A smooth sinusoidal oscillation. Produces fluid lines with fewer abrupt direction changes and generally less mechanical chatter.',
         ekg: 'A mostly restrained line with periodic sharp pulse-like deviations. Best used as a stylized texture rather than neutral photographic shading.',
+        swirl: 'Adds circular loops in darker areas. Loop overlap is intentional local density.',
         straight: 'No transverse waveform displacement. Brightness is represented only by retaining or removing layout carriers.'
     },
     brightnessModulation: {
@@ -168,7 +170,7 @@ function readPositiveNumber(id, fallback) {
 }
 
 function generationModeUsesHatch(mode = document.getElementById('generationMode')?.value) {
-    return mode === 'hatch' || mode === 'outline-hatch';
+    return mode === 'hatch' || mode === 'single-line' || mode === 'outline-hatch';
 }
 
 function generationModeUsesOutline(mode = document.getElementById('generationMode')?.value) {
@@ -1223,6 +1225,7 @@ function updateGenerationModeVisibility() {
     const hatchControls = document.getElementById('hatchModeControls');
     const outlineHelp = document.getElementById('outlineModeHelp');
     const outlineHatchHelp = document.getElementById('outlineHatchModeHelp');
+    const singleLineHelp = document.getElementById('singleLineModeHelp');
     const outlineTraceMethodGroup = document.getElementById('outlineTraceMethodGroup');
     const generateButton = document.getElementById('generateBtn');
     const hatchEnabled = generationModeUsesHatch(mode);
@@ -1230,11 +1233,13 @@ function updateGenerationModeVisibility() {
     if (hatchControls) hatchControls.hidden = !hatchEnabled;
     if (outlineHelp) outlineHelp.hidden = !outlineOnly;
     if (outlineHatchHelp) outlineHatchHelp.hidden = mode !== 'outline-hatch';
+    if (singleLineHelp) singleLineHelp.hidden = mode !== 'single-line';
     if (outlineTraceMethodGroup) outlineTraceMethodGroup.hidden = !generationModeUsesOutline(mode);
     if (generateButton) {
         generateButton.textContent = outlineOnly
             ? 'Trace SVG Outlines'
-            : mode === 'outline-hatch' ? 'Outline then Hatch' : 'Generate Toolpath';
+            : mode === 'outline-hatch' ? 'Outline then Hatch'
+                : mode === 'single-line' ? 'Generate Single Line' : 'Generate Toolpath';
     }
     if (patternCenterMarker) patternCenterMarker.visible = hatchEnabled;
     if (!hatchEnabled) {
@@ -1250,6 +1255,14 @@ function updateGenerationModeVisibility() {
 function updatePatternControlVisibility() {
     const layout = document.getElementById('patternLayout').value;
     const waveform = document.getElementById('waveform').value;
+    const singleLine = document.getElementById('generationMode').value === 'single-line';
+    Array.from(document.getElementById('patternLayout').options).forEach(option => {
+        option.disabled = singleLine && !['linear', 'concentric'].includes(option.value);
+    });
+    if (singleLine && !['linear', 'concentric'].includes(layout)) {
+        document.getElementById('patternLayout').value = 'linear';
+        return updatePatternControlVisibility();
+    }
     document.getElementById('patternAngleGroup').style.display = ['linear', 'radial'].includes(layout) ? '' : 'none';
     document.getElementById('patternDirectionGroup').style.display = ['spiral', 'concentric', 'radial'].includes(layout) ? 'flex' : 'none';
     document.getElementById('waveformControls').style.display = waveform === 'straight' ? 'none' : 'flex';
@@ -1453,12 +1466,15 @@ document.getElementById('workspaceOrigin').addEventListener('change', event => {
 document.getElementById('generationMode').addEventListener('change', () => {
     saveMachineSettings();
     updateGenerationModeVisibility();
+    updatePatternControlVisibility();
     updateOutputFilenamePreview();
     const mode = document.getElementById('generationMode').value;
     document.getElementById('generationStatus').textContent = mode === 'outline'
         ? 'Outline Trace mode selected. Native SVG paths and shape boundaries will be traced directly.'
         : mode === 'outline-hatch'
             ? 'Outline then Hatch selected. Vector borders will plot first, followed by brightness-driven hatching.'
+            : mode === 'single-line'
+                ? 'Single Line Raster selected. One continuous pen-down path will cover the image.'
             : 'Brightness Hatch mode selected. Tone controls local line density.';
 });
 
@@ -1742,9 +1758,9 @@ async function applyConvertedSvgRecord(record, requestedMode) {
     const svgText = record.svgText || record.svg;
     const filename = record.filename || 'converted-image.svg';
     await loadSvgText(svgText, filename, 'Received');
-    const selectedMode = ['outline', 'outline-hatch', 'hatch'].includes(requestedMode)
+    const selectedMode = ['outline', 'outline-hatch', 'hatch', 'single-line'].includes(requestedMode)
         ? requestedMode
-        : ['outline', 'outline-hatch', 'hatch'].includes(record.generationMode)
+        : ['outline', 'outline-hatch', 'hatch', 'single-line'].includes(record.generationMode)
             ? record.generationMode
             : 'outline';
     const modeSelect = document.getElementById('generationMode');
@@ -2202,6 +2218,7 @@ const OUTPUT_ORIGIN_CODES = {
 const OUTPUT_GENERATION_CODES = {
     outline: 'OUTLINE',
     hatch: 'HATCH',
+    'single-line': '1LINE',
     'outline-hatch': 'OTH'
 };
 const OUTPUT_LAYOUT_LABELS = {
