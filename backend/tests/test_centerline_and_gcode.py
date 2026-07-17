@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import pathlib
 import sys
 import unittest
@@ -149,9 +150,49 @@ class CustomGcodeTests(unittest.TestCase):
         self.assertGreater(len(result["paths"][0]), 100)
         self.assertEqual(result["stats"]["continuous_paths"], 1)
         self.assertEqual(result["stats"]["pen_lifts_during_image"], 0)
+        left, top, right, bottom = result["stats"]["scan_bounds_mm"]
+        self.assertGreater(left, 4.0)
+        self.assertGreater(top, 4.0)
+        self.assertLess(right, 16.0)
+        self.assertLess(bottom, 16.0)
+        self.assertTrue(all(
+            left <= point[0] <= right and top <= point[1] <= bottom
+            for point in result["paths"][0]
+        ))
         lines = result["gcode"].splitlines()
         self.assertEqual(lines.count("G1 Z0 F300"), 1)
         self.assertEqual(lines.count("G0 Z5"), 2)
+
+    def test_concentric_single_line_has_no_boundary_chords(self) -> None:
+        pixels = np.full((40, 60), 255, dtype=np.uint8)
+        pixels[5:35, 8:52] = 0
+        self.params.update({
+            "bedX": 30.0,
+            "bedY": 20.0,
+            "svgPosX": 15.0,
+            "svgPosY": 10.0,
+            "generationMode": "single-line",
+            "patternLayout": "concentric",
+            "waveform": "straight",
+            "patternCenterX": 15.0,
+            "patternCenterY": 10.0,
+            "patternAngle": 0.0,
+            "patternSpacing": 1.0,
+            "patternClockwise": True,
+            "waveAmplitude": 0.0,
+            "waveLength": 2.0,
+            "brightnessModulation": "both",
+        })
+
+        result = generate_toolpath(
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="30" height="20"/>',
+            self.params,
+            _png_bytes(pixels),
+        )
+
+        points = result["paths"][0]
+        longest_segment = max(math.dist(first, second) for first, second in zip(points, points[1:]))
+        self.assertLess(longest_segment, 2.0)
 
 
 def _png_bytes(pixels: np.ndarray) -> bytes:

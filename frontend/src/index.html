@@ -566,7 +566,7 @@
         </header>
         <nav class="workspace-switch" aria-label="HatchPlot workspace">
             <a href="./" aria-current="page">Toolpath</a>
-            <a href="./converter.html">Image Conversion</a>
+            <a href="./converter.html">Image Conversion · Beta</a>
         </nav>
 
         <details class="section" id="machineSection" open>
@@ -683,6 +683,7 @@
                     <label for="generationMode">Generation mode</label>
                     <select id="generationMode" name="generationMode">
                         <option value="hatch">Brightness Hatch</option>
+                        <option value="full-fill">Full Fill</option>
                         <option value="single-line">Single Line Raster</option>
                         <option value="outline">Outline Trace</option>
                         <option value="outline-hatch">Outline then Hatch</option>
@@ -698,6 +699,7 @@
                 <div id="outlineModeHelp" class="helper-card" hidden>Outline Trace can follow native SVG boundaries or scan the rendered artwork into single-stroke centerlines. Brightness, layout, and waveform controls are not used in this mode.</div>
                 <div id="outlineHatchModeHelp" class="helper-card" hidden>Outline then Hatch plots the selected boundary or centerline trace first, then adds the brightness-driven hatch pattern. Both passes are included in the exported G-code header.</div>
                 <div id="singleLineModeHelp" class="helper-card" hidden>Single Line Raster covers the image with one uninterrupted pen-down path. Linear uses a serpentine scan; Concentric uses one continuous spiral. Brightness adds zig-zag, EKG, or swirl texture and density.</div>
+                <div id="fullFillModeHelp" class="helper-card" hidden>Full Fill traces the SVG boundary first, then fills it with overlapping straight lines. Step-over is fixed at 80% of the pen-tip width.</div>
                 <div class="form-group">
                     <label for="penThickness">Pen size / tip thickness (mm)</label>
                     <input type="number" id="penThickness" name="penThickness" min="0.05" max="10" step="0.05" placeholder="e.g. 0.5">

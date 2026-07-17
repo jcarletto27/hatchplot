@@ -627,14 +627,14 @@ def validate_generation_params(params: dict[str, Any]) -> None:
         raise GenerationError("penThickness must be between 0.05 and 10 mm.")
 
     generation_mode = str(params.get("generationMode", "hatch"))
-    if generation_mode not in {"hatch", "single-line", "outline", "outline-hatch"}:
-        raise GenerationError("generationMode must be hatch, single-line, outline, or outline-hatch.")
+    if generation_mode not in {"hatch", "full-fill", "single-line", "outline", "outline-hatch"}:
+        raise GenerationError("generationMode must be hatch, full-fill, single-line, outline, or outline-hatch.")
     if params.get("outlineTraceMethod", "boundary") not in {"boundary", "centerline"}:
         raise GenerationError("outlineTraceMethod must be boundary or centerline.")
     if params.get("workspaceOrigin", "top-left") not in {"top-left", "top-right", "bottom-left", "bottom-right"}:
         raise GenerationError("workspaceOrigin must be top-left, top-right, bottom-left, or bottom-right.")
 
-    if generation_mode in {"hatch", "single-line", "outline-hatch"}:
+    if generation_mode in {"hatch", "full-fill", "single-line", "outline-hatch"}:
         density_fudge = float(params.get("densityFudge", 0.0))
         if not math.isfinite(density_fudge) or not -0.5 <= density_fudge <= 0.5:
             raise GenerationError("densityFudge must be between -0.5 and 0.5.")
@@ -1516,8 +1516,18 @@ def _generate_brightness_paths(
     angle_degrees = float(params.get("patternAngle", 0.0))
     clockwise = bool(params.get("patternClockwise", True))
     brightness_mode = str(params.get("brightnessModulation", "both"))
+    full_fill = str(params.get("generationMode", "hatch")) == "full-fill"
     density_scale = 1.0 - (density_fudge * 0.8)
-    layout_spacing = max(pen_thickness, float(params.get("patternSpacing", pen_thickness * 1.55)) * density_scale)
+    # Full Fill deliberately overlaps adjacent pen strokes. The fixed ratio
+    # guarantees a step-over strictly smaller than the physical tip width.
+    layout_spacing = (
+        pen_thickness * 0.8
+        if full_fill
+        else max(pen_thickness, float(params.get("patternSpacing", pen_thickness * 1.55)) * density_scale)
+    )
+    if full_fill:
+        waveform = "straight"
+        density_fudge = 0.0
     wave_amplitude = max(0.0, float(params.get("waveAmplitude", layout_spacing * 0.42)))
     wave_length = max(pen_thickness * 2.0, float(params.get("waveLength", pen_thickness * 6.0)) * density_scale)
 
@@ -1574,7 +1584,10 @@ def _generate_brightness_paths(
                 layout, carrier_index, point, center_x, center_y, layout_spacing
             )
             sampled_points += 1
-            if not _passes_density_gate(darkness, brightness_cutoff, lane_index):
+            passes_fill = darkness > 0.0 and darkness >= brightness_cutoff if full_fill else _passes_density_gate(
+                darkness, brightness_cutoff, lane_index
+            )
+            if not passes_fill:
                 if len(current_run) >= 2:
                     completed_paths.append(current_run)
                     preview_pending.append(current_run)
@@ -1619,7 +1632,10 @@ def _generate_brightness_paths(
             output_darkness = max(
                 0.0, min(1.0, output_darkness * (1.0 + density_fudge))
             )
-            if not _passes_density_gate(output_darkness, brightness_cutoff, lane_index):
+            passes_output_fill = output_darkness > 0.0 and output_darkness >= brightness_cutoff if full_fill else _passes_density_gate(
+                output_darkness, brightness_cutoff, lane_index
+            )
+            if not passes_output_fill:
                 if len(current_run) >= 2:
                     completed_paths.append(current_run)
                     preview_pending.append(current_run)
@@ -1659,7 +1675,7 @@ def _generate_brightness_paths(
     _set_progress(progress, phase="path-building", percent=92.0, completed=total_carriers, total=total_carriers, detail="Pattern paths are ready; compiling G-code...", compute_backend=compute_backend)
     return completed_paths, {
         "source": "browser-brightness-map",
-        "generation_mode": "hatch",
+        "generation_mode": "full-fill" if full_fill else "hatch",
         "workspace_origin": str(params.get("workspaceOrigin", "top-left")),
         "map_width": rgba.width,
         "map_height": rgba.height,
@@ -1673,6 +1689,8 @@ def _generate_brightness_paths(
         "brightness_cutoff": brightness_cutoff,
         "pattern_layout": layout,
         "waveform": waveform,
+        "full_fill": full_fill,
+        "step_over_mm": round(layout_spacing, 4),
         "pattern_center_x": center_x,
         "pattern_center_y": center_y,
         "pattern_angle": angle_degrees,
@@ -1723,9 +1741,32 @@ def _generate_single_line_path(
     rgba = image.convert("RGBA")
     pixel_mm = max(bed_x / max(1, rgba.width - 1), bed_y / max(1, rgba.height - 1))
     sample_step = max(pen_thickness * 0.4, pixel_mm, 0.05)
+    source = np.asarray(rgba, dtype=np.uint8)
+    samples = source.astype(np.float64)
+    luminance = (0.299 * samples[:, :, 0] + 0.587 * samples[:, :, 1] + 0.114 * samples[:, :, 2]) / 255.0
+    adjusted_darkness = np.clip(
+        (1.0 - luminance) * (samples[:, :, 3] / 255.0) * (1.0 + density_fudge),
+        0.0,
+        1.0,
+    )
+    qualifying_y, qualifying_x = np.nonzero(
+        (adjusted_darkness >= cutoff) & (adjusted_darkness > 0.0)
+    )
+    if qualifying_x.size == 0:
+        raise GenerationError("The transformed SVG contains no pixels above the brightness cutoff.")
+
+    # Raster only the cutoff-qualified artwork extent, not the machine bed.
+    scan_left = (float(qualifying_x.min()) / max(1, rgba.width - 1)) * bed_x
+    scan_right = (float(qualifying_x.max()) / max(1, rgba.width - 1)) * bed_x
+    scan_top = (float(qualifying_y.min()) / max(1, rgba.height - 1)) * bed_y
+    scan_bottom = (float(qualifying_y.max()) / max(1, rgba.height - 1)) * bed_y
+    scan_width = max(sample_step, scan_right - scan_left)
+    scan_height = max(sample_step, scan_bottom - scan_top)
+    local_center_x = min(scan_width, max(0.0, center_x - scan_left))
+    local_center_y = min(scan_height, max(0.0, center_y - scan_top))
     carrier_layout = "spiral" if layout == "concentric" else "linear"
     carriers = _build_pattern_carriers(
-        carrier_layout, bed_x, bed_y, center_x, center_y, spacing,
+        carrier_layout, scan_width, scan_height, local_center_x, local_center_y, spacing,
         sample_step, angle, clockwise,
     )
 
@@ -1733,7 +1774,24 @@ def _generate_single_line_path(
     # their endpoints makes one continuous raster path with no pen lifts.
     base: list[tuple[float, float]] = []
     for carrier in carriers:
-        inside = [point for point in carrier if 0.0 <= point[0] <= bed_x and 0.0 <= point[1] <= bed_y]
+        if carrier_layout == "spiral":
+            # A spiral repeatedly exits and re-enters a rectangular image near
+            # its outer turns. Dropping those outside arcs creates long diagonal
+            # chords. Clamp them to the boundary so motion follows an edge.
+            inside = []
+            for point in carrier:
+                bounded = (
+                    min(scan_right, max(scan_left, point[0] + scan_left)),
+                    min(scan_bottom, max(scan_top, point[1] + scan_top)),
+                )
+                if not inside or math.dist(inside[-1], bounded) > 1e-6:
+                    inside.append(bounded)
+        else:
+            inside = [
+                (point[0] + scan_left, point[1] + scan_top)
+                for point in carrier
+                if 0.0 <= point[0] <= scan_width and 0.0 <= point[1] <= scan_height
+            ]
         if len(inside) < 2:
             continue
         if base and math.dist(base[-1], inside[0]) > sample_step:
@@ -1789,7 +1847,10 @@ def _generate_single_line_path(
             offset = _waveform_value(waveform, phase) * radius
             x = point[0] + normal_x * offset
             y = point[1] + normal_y * offset
-        points.append([round(min(bed_x, max(0.0, x)), 4), round(min(bed_y, max(0.0, y)), 4)])
+        points.append([
+            round(min(scan_right, max(scan_left, x)), 4),
+            round(min(scan_bottom, max(scan_top, y)), 4),
+        ])
 
     if len(points) > MAX_TOOLPATH_POINTS:
         raise GenerationLimitError(f"The single line exceeded {MAX_TOOLPATH_POINTS:,} toolpath points.")
@@ -1807,6 +1868,10 @@ def _generate_single_line_path(
         "pen_lifts_during_image": 0,
         "sample_step_mm": round(sample_step, 4),
         "pattern_spacing_mm": round(spacing, 4),
+        "scan_bounds_mm": [
+            round(scan_left, 4), round(scan_top, 4),
+            round(scan_right, 4), round(scan_bottom, 4),
+        ],
         "compute_backend": compute_backend,
         "gpu_accelerated": compute_backend == "cuda",
         "live_preview_points": preview_state["points"],
@@ -1867,6 +1932,7 @@ def _suggest_output_filename(params: dict[str, Any]) -> str:
     generation_codes = {
         "outline": "OUTLINE",
         "hatch": "HATCH",
+        "full-fill": "FILL",
         "single-line": "1LINE",
         "outline-hatch": "OTH",
     }
@@ -1882,7 +1948,7 @@ def _suggest_output_filename(params: dict[str, Any]) -> str:
         origin_codes.get(str(params.get("workspaceOrigin", "top-left")), "TL"),
         generation_codes.get(generation_mode, generation_mode.upper() or "HATCH"),
     ]
-    if generation_mode in {"hatch", "single-line", "outline-hatch"}:
+    if generation_mode in {"hatch", "full-fill", "single-line", "outline-hatch"}:
         layout = str(params.get("patternLayout", "")).strip().lower()
         if layout:
             parts.append(layout_labels.get(layout, layout[:1].upper() + layout[1:]))
@@ -1980,12 +2046,23 @@ def _gcode_preamble(
             if outline_method == "centerline"
             else "Outline: native SVG strokes and filled-shape vector boundaries"
         )
-    if generation_mode in {"hatch", "single-line", "outline-hatch"}:
+    if generation_mode in {"hatch", "full-fill", "single-line", "outline-hatch"}:
+        effective_density_fudge = 0.0 if generation_mode == "full-fill" else float(params.get("densityFudge", 0.0))
+        effective_modulation = "none" if generation_mode == "full-fill" else params.get("brightnessModulation", "both")
+        effective_waveform = "straight" if generation_mode == "full-fill" else params.get("waveform", "zigzag")
+        spacing = (
+            float(params.get("penThickness", 0.5)) * 0.8
+            if generation_mode == "full-fill"
+            else float(params.get("patternSpacing", 1.0))
+        )
         comments.extend([
-            f"Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={float(params.get('densityFudge', 0.0)):+.3f}; modulation={_gcode_comment_value(params.get('brightnessModulation', 'both'))}",
-            f"Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={float(params.get('patternSpacing', 1.0)):.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({display_center_x:.3f}, {display_center_y:.3f}) mm; direction={direction}",
-            f"Waveform: type={_gcode_comment_value(params.get('waveform', 'zigzag'))}; amplitude={float(params.get('waveAmplitude', 0.5)):.3f} mm; wavelength={float(params.get('waveLength', 3.0)):.3f} mm",
+            f"Brightness: cutoff={float(params.get('brightnessCutoff', DEFAULT_BRIGHTNESS_CUTOFF)):.3f}; density fudge={effective_density_fudge:+.3f}; modulation={_gcode_comment_value(effective_modulation)}",
+            f"Pattern: layout={_gcode_comment_value(params.get('patternLayout', 'linear'))}; spacing={spacing:.3f} mm; angle={float(params.get('patternAngle', 0.0)):.3f} deg; center=({display_center_x:.3f}, {display_center_y:.3f}) mm; direction={direction}",
+            f"Waveform: type={_gcode_comment_value(effective_waveform)}; amplitude={0.0 if generation_mode == 'full-fill' else float(params.get('waveAmplitude', 0.5)):.3f} mm; wavelength={float(params.get('waveLength', 3.0)):.3f} mm",
         ])
+        if generation_mode == "full-fill":
+            comments.append("Full Fill: straight overlapping strokes; step-over is 80% of pen size")
+            comments.append("Sequence: SVG boundary outlines are plotted first, followed by Full Fill strokes")
     if generation_mode == "outline-hatch":
         comments.append(
             "Sequence: selected outline traces are plotted first, followed "
@@ -2107,6 +2184,84 @@ def generate_toolpath(
             total=len(compiled_paths),
             detail="Centerline trace generation completed.",
             compute_backend="numpy-cpu",
+            force_eta_zero=True,
+        )
+        return {"gcode": "\n".join(gcode), "paths": compiled_paths, "stats": stats}
+
+    if generation_mode == "full-fill" and not params.get("_fullFillPassOnly"):
+        _set_progress(
+            progress,
+            phase="outline-processing",
+            percent=3.0,
+            detail="Tracing SVG boundaries before Full Fill...",
+            compute_backend="geos-cpu",
+        )
+        outline_params = dict(params)
+        outline_params["generationMode"] = "outline"
+        outline_params["outlineTraceMethod"] = "boundary"
+        outline_result = generate_toolpath(svg_content, outline_params, None, None, None)
+        outline_paths = list(outline_result.get("paths") or [])
+
+        fill_params = dict(params)
+        fill_params["_fullFillPassOnly"] = True
+        fill_result = generate_toolpath(svg_content, fill_params, None, None, None)
+        fill_paths = list(fill_result.get("paths") or [])
+        fill_stats = dict(fill_result.get("stats") or {})
+        compiled_paths = outline_paths + fill_paths
+        toolpath_points = sum(len(path) for path in compiled_paths)
+        if len(compiled_paths) > MAX_HATCH_PATHS:
+            raise GenerationLimitError(
+                f"The outline and Full Fill result generated more than {MAX_HATCH_PATHS:,} toolpaths."
+            )
+        if toolpath_points > MAX_TOOLPATH_POINTS:
+            raise GenerationLimitError(
+                f"The outline and Full Fill result exceeded {MAX_TOOLPATH_POINTS:,} toolpath points."
+            )
+
+        preview_state = {"points": 0, "chunks": 0}
+        preview_pending: list[list[list[float]]] = []
+        for path in compiled_paths:
+            preview_pending.append(path)
+            if sum(len(item) for item in preview_pending) >= LIVE_PREVIEW_CHUNK_POINTS:
+                _publish_live_preview(preview_queue, preview_pending, preview_state)
+                preview_pending = []
+        _publish_live_preview(preview_queue, preview_pending, preview_state)
+
+        _set_progress(
+            progress,
+            phase="gcode",
+            percent=94.0,
+            completed=0,
+            total=len(compiled_paths),
+            detail="Compiling outline-first and Full-Fill-second paths into G-code...",
+            compute_backend="geos-cpu",
+        )
+        machining_estimate = _estimate_machining_time(compiled_paths, params)
+        gcode = _compile_gcode(compiled_paths, params, machining_estimate)
+        duration = time.perf_counter() - started
+        stats = {
+            **fill_stats,
+            **machining_estimate,
+            "output_filename": _suggest_output_filename(params),
+            "duration_seconds": round(duration, 3),
+            "outline_paths": len(outline_paths),
+            "hatch_paths": len(fill_paths),
+            "continuous_paths": len(compiled_paths),
+            "toolpath_points": toolpath_points,
+            "gcode_lines": len(gcode),
+            "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths), machining_estimate)),
+            "generation_mode": "full-fill",
+            "path_sequence": "outline-then-full-fill",
+            "live_preview_points": preview_state["points"],
+        }
+        _set_progress(
+            progress,
+            phase="completed",
+            percent=100.0,
+            completed=len(compiled_paths),
+            total=len(compiled_paths),
+            detail="Outline then Full Fill generation completed.",
+            compute_backend="geos-cpu",
             force_eta_zero=True,
         )
         return {"gcode": "\n".join(gcode), "paths": compiled_paths, "stats": stats}
@@ -2245,7 +2400,7 @@ def generate_toolpath(
                 "output_filename": _suggest_output_filename(params),
                 "duration_seconds": round(duration, 3),
                 "drawable_elements": None,
-                "hatch_paths": len(compiled_paths) if generation_mode == "hatch" else 0,
+                "hatch_paths": len(compiled_paths) if generation_mode in {"hatch", "full-fill"} else 0,
                 "continuous_paths": len(compiled_paths),
                 "toolpath_points": toolpath_points,
                 "gcode_lines": len(gcode),
@@ -2292,7 +2447,7 @@ def generate_toolpath(
     # than the actual toolpath work. For outline tracing the viewport is the
     # correct clipping/reference frame and is available without curve analysis.
     if (
-        generation_mode == "outline"
+        generation_mode in {"outline", "full-fill"}
         and viewbox_values is not None
         and all(math.isfinite(value) for value in viewbox_values)
         and viewbox_values[2] > 0.0
@@ -2310,7 +2465,7 @@ def generate_toolpath(
         min_x, min_y, max_x, max_y = map(float, bbox)
         svg_width = max_x - min_x
         svg_height = max_y - min_y
-    if generation_mode == "outline":
+    if generation_mode in {"outline", "full-fill"}:
         # Valid line art may be a single horizontal or vertical open stroke, whose
         # geometry bounds have zero height or width. Only reject a point-like SVG.
         if svg_width <= 0 and svg_height <= 0:
@@ -2331,7 +2486,7 @@ def generate_toolpath(
     # Browser outline jobs include the imported physical size because SVG parsers
     # normalize CSS units to px. This maps parsed coordinates back to millimeters
     # before applying the user's percentage scale.
-    if generation_mode == "outline" and parsed_width > 0.0 and parsed_height > 0.0:
+    if generation_mode in {"outline", "full-fill"} and parsed_width > 0.0 and parsed_height > 0.0:
         if source_width_mm > 0.0 and source_height_mm > 0.0:
             physical_scale = min(source_width_mm / parsed_width, source_height_mm / parsed_height)
         else:
@@ -2345,7 +2500,7 @@ def generate_toolpath(
         scale = requested_scale if scale_mode == "absolute" else fit_scale * requested_scale
     source_center = (
         (parsed_width / 2.0, parsed_height / 2.0)
-        if generation_mode == "outline" and parsed_width > 0.0 and parsed_height > 0.0
+        if generation_mode in {"outline", "full-fill"} and parsed_width > 0.0 and parsed_height > 0.0
         else ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
     )
     destination = (float(params["svgPosX"]), float(params["svgPosY"]))
@@ -2424,13 +2579,20 @@ def generate_toolpath(
             safe_polygon = polygon.intersection(machine_bed)
             if safe_polygon.is_empty:
                 continue
-            density_fudge = float(params.get("densityFudge", 0.0))
-            density_scale = 1.0 - (density_fudge * 0.8)
-            spacing = max(
-                float(params.get("penThickness", 0.5)),
-                (0.5 + (get_luminance(color) * 4.5)) * density_scale,
+            if generation_mode == "full-fill":
+                spacing = float(params.get("penThickness", 0.5)) * 0.8
+            else:
+                density_fudge = float(params.get("densityFudge", 0.0))
+                density_scale = 1.0 - (density_fudge * 0.8)
+                spacing = max(
+                    float(params.get("penThickness", 0.5)),
+                    (0.5 + (get_luminance(color) * 4.5)) * density_scale,
+                )
+            hatch_grid = create_hatch_lines(
+                safe_polygon.bounds,
+                spacing,
+                float(params.get("patternAngle", 45.0)),
             )
-            hatch_grid = create_hatch_lines(safe_polygon.bounds, spacing)
             # Intersect the complete grid in one GEOS operation. The original code
             # intersected every line independently, which was the primary timeout hot path.
             clipped_grid = safe_polygon.intersection(hatch_grid)
@@ -2489,7 +2651,7 @@ def generate_toolpath(
         "output_filename": _suggest_output_filename(params),
         "duration_seconds": round(duration, 3),
         "drawable_elements": drawable_elements,
-        "hatch_paths": len(compiled_paths) if generation_mode == "hatch" else 0,
+        "hatch_paths": len(compiled_paths) if generation_mode in {"hatch", "full-fill"} else 0,
         "outline_paths": len(compiled_paths) if generation_mode == "outline" else 0,
         "continuous_paths": len(compiled_paths),
         "generation_mode": generation_mode,
@@ -2499,17 +2661,25 @@ def generate_toolpath(
         "gcode_header_lines": len(_gcode_preamble(params, len(compiled_paths), machining_estimate)),
         "scale_mode": scale_mode,
         "scale_percent": float(params["svgScale"]),
-        "source_width": round(source_width_mm if generation_mode == "outline" and source_width_mm > 0.0 else svg_width, 4),
-        "source_height": round(source_height_mm if generation_mode == "outline" and source_height_mm > 0.0 else svg_height, 4),
+        "source_width": round(source_width_mm if generation_mode in {"outline", "full-fill"} and source_width_mm > 0.0 else svg_width, 4),
+        "source_height": round(source_height_mm if generation_mode in {"outline", "full-fill"} and source_height_mm > 0.0 else svg_height, 4),
         "compute_backend": "geos-cpu",
         "gpu_accelerated": False,
         "live_preview_points": preview_state["points"],
     }
-    if generation_mode == "hatch":
+    if generation_mode in {"hatch", "full-fill"}:
         stats.update({
             "density_fudge": float(params.get("densityFudge", 0.0)),
             "brightness_cutoff": float(params.get("brightnessCutoff", DEFAULT_BRIGHTNESS_CUTOFF)),
         })
+        if generation_mode == "full-fill":
+            stats.update({
+                "full_fill": True,
+                "step_over_mm": round(float(params.get("penThickness", 0.5)) * 0.8, 4),
+                "pattern_spacing_mm": round(float(params.get("penThickness", 0.5)) * 0.8, 4),
+                "pattern_angle": float(params.get("patternAngle", 45.0)),
+                "waveform": "straight",
+            })
     else:
         stats.update({
             "outline_sampling_mm": max(0.05, float(params.get("penThickness", 0.5)) * 0.35),
